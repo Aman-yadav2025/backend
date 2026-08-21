@@ -1,0 +1,1 @@
+ALTER TABLE refund_requests ADD COLUMN razorpay_refund_id TEXT UNIQUE;
