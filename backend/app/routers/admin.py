@@ -16,8 +16,9 @@ from app.models import (
     Profile,
     RefundRequest,
     RefundRequestStatus,
+    SystemRole,
 )
-from app.schemas import DocumentOut, DocumentVerifyRequest, RefundRequestOut
+from app.schemas import DocumentOut, DocumentVerifyRequest, RefundRequestOut, ProfileOut
 from app.security import require_platform_admin
 from app.services import razorpay_client
 
@@ -232,3 +233,31 @@ async def verify_document(
     await db.commit()
     await db.refresh(document)
     return document
+
+
+# ---------------------------------------------------------------------------
+# Promote Platform Admin
+# ---------------------------------------------------------------------------
+@router.post("/platform-admins/{profile_id}", response_model=ProfileOut)
+async def create_platform_admin(
+    profile_id: str,
+    admin: Profile = Depends(require_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Promotes an existing profile to PLATFORM_ADMIN.
+    Only an existing PLATFORM_ADMIN can perform this action.
+    """
+    result = await db.execute(select(Profile).where(Profile.id == profile_id).with_for_update())
+    profile = result.scalar_one_or_none()
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    if profile.system_role == SystemRole.PLATFORM_ADMIN:
+        return profile  # Already a platform admin
+
+    profile.system_role = SystemRole.PLATFORM_ADMIN
+    
+    await db.commit()
+    await db.refresh(profile)
+    return profile

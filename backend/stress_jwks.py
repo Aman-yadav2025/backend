@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 from app.security import SafeJWKSClient
-
 async def fake_get(*args, **kwargs):
     await asyncio.sleep(0.1) # Simulate 100ms network latency
     class FakeResponse:

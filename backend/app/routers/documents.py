@@ -1,13 +1,14 @@
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
 from app.models import CompanyMember, Document, Profile, MemberRole, MemberStatus, DocumentStatus
+from app.rate_limit import limiter
 from app.schemas import (
     DocumentCreate,
     DocumentDownloadResponse,
@@ -22,7 +23,9 @@ router = APIRouter(prefix="/companies/{company_id}/documents", tags=["documents"
 
 
 @router.post("/presign", response_model=DocumentPresignResponse)
+@limiter.limit("10/minute")  # Strict: prevents R2 presigned URL exhaustion attacks
 async def presign_upload(
+    request: Request,  # Required by SlowAPI to extract the client IP
     company_id: uuid.UUID,
     body: DocumentPresignRequest,
     _membership: CompanyMember = Depends(require_active_company_membership),

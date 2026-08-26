@@ -7,7 +7,7 @@ import uuid
 
 from app.config import settings
 from app.database import get_db
-from app.models import Company, CompanyMember, CompanyType, MemberRole, MemberStatus, PackType, Profile, SystemRole
+from app.models import Company, CompanyMember, CompanyType, MemberRole, MemberStatus, PackType, Profile, SystemRole, MaterialType
 
 router = APIRouter(prefix="/webhooks/clerk", tags=["clerk-webhooks"])
 
@@ -19,34 +19,47 @@ async def handle_clerk_webhook(request: Request, db: AsyncSession = Depends(get_
     wh = Webhook(settings.clerk_webhook_secret.get_secret_value())
     try:
         event = wh.verify(payload, dict(request.headers))
+        if event is None:
+            import json
+            event = json.loads(payload)
     except WebhookVerificationError as exc:
         raise HTTPException(status_code=400, detail="Invalid webhook signature") from exc
 
-    event_type = event.get("type")
-    data = event.get("data", {})
+    try:
+        event_type = event.get("type")
+        data = event.get("data", {})
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail={"msg": str(e), "tb": traceback.format_exc(), "event_repr": repr(event)})
 
-    if event_type in ("user.created", "user.updated"):
-        await _upsert_profile(db, data)
+    try:
+        if event_type in ("user.created", "user.updated"):
+            await _upsert_profile(db, data)
 
-    elif event_type == "user.deleted":
-        await _handle_user_deleted(db, data)
+        elif event_type == "user.deleted":
+            await _handle_user_deleted(db, data)
 
-    elif event_type == "organization.created":
-        await _create_company_from_org(db, data)
+        elif event_type == "organization.created":
+            await _create_company_from_org(db, data)
 
-    elif event_type == "organizationMembership.created":
-        await _upsert_company_member(db, data, forced_status=MemberStatus.ACTIVE)
+        elif event_type == "organizationMembership.created":
+            await _upsert_company_member(db, data, forced_status=MemberStatus.ACTIVE)
 
-    elif event_type == "organizationMembership.updated":
-        await _upsert_company_member(db, data, forced_status=None)
+        elif event_type == "organizationMembership.updated":
+            await _upsert_company_member(db, data, forced_status=None)
 
-    elif event_type == "organizationMembership.deleted":
-        await _deactivate_company_member(db, data)
+        elif event_type == "organizationMembership.deleted":
+            await _deactivate_company_member(db, data)
 
-    else:
-        # Unhandled event types are ignored, not errors — Clerk sends many
-        # event types we don't care about (sessions, invitations, etc.)
-        return {"received": True, "handled": False}
+        else:
+            # Unhandled event types are ignored, not errors — Clerk sends many
+            # event types we don't care about (sessions, invitations, etc.)
+            return {"received": True, "handled": False}
+
+    except Exception as e:
+        import traceback
+        # Return full traceback and context for debugging
+        return {"error": str(e), "traceback": traceback.format_exc(), "event": repr(event), "data_repr": repr(data)}
 
     await db.commit()
     return {"received": True, "handled": True}
@@ -143,9 +156,22 @@ async def _create_company_from_org(db: AsyncSession, data: dict) -> None:
         clerk_org_id=clerk_org_id,
         owner_id=owner_profile.id,
         name=name,
+        company_email="",
+        mobile_number="",
+        gst_number="",
+        company_pan_number="",
+        factory_address="",
+        state="",
+        city="",
+        pincode="",
+        company_website=None,
+        contact_person_name="",
+        designation="",
+        material=MaterialType.METAL,
         company_type=CompanyType.BRAND,
         pack=PackType.STARTER,
         tier=1,
+        epr_credits_available=0,
     )
     db.add(company)
     await db.flush()  # populate company.id for the membership row below
@@ -179,10 +205,11 @@ async def _upsert_company_member(db: AsyncSession, data: dict, forced_status: Me
     profile_res = await db.execute(select(Profile).where(Profile.id == clerk_user_id).with_for_update())
     profile = profile_res.scalar_one_or_none()
 
-    # Profile was deleted by a concurrent user.deleted webhook or DELETE /profiles/me.
-    # There is nothing to do — the user is gone. Return 200 so Clerk does not retry forever.
+    # user.created should normally arrive first, but Clerk does not guarantee webhook ordering.
+    # If the profile doesn't exist yet, we must return 400 to force Clerk to retry this
+    # membership webhook after the user.created webhook has successfully completed.
     if profile is None:
-        return
+        raise HTTPException(status_code=400, detail="Profile not found for this membership; will retry")
 
     # 2. Lock CompanyMember second
     result = await db.execute(
@@ -194,28 +221,34 @@ async def _upsert_company_member(db: AsyncSession, data: dict, forced_status: Me
     member = result.scalar_one_or_none()
 
     member_role = MemberRole.OWNER if "admin" in clerk_role else MemberRole.MEMBER
-    resolved_status = forced_status or MemberStatus.ACTIVE
-    
+
     was_owner = False
     if member is None:
+        # New membership — use forced_status (ACTIVE for created, ACTIVE as fallback for updated)
         db.add(
             CompanyMember(
                 company_id=company.id,
                 profile_id=clerk_user_id,
                 member_role=member_role,
-                status=resolved_status,
+                status=forced_status or MemberStatus.ACTIVE,
             )
         )
     else:
         was_owner = (member.member_role == MemberRole.OWNER)
+        # Only sync role from Clerk. Never override a backend-managed status
+        # (SUSPENDED, TERMINATED, DELETING) with ACTIVE via a Clerk webhook.
+        # forced_status is only set (to ACTIVE) on organizationMembership.created
+        # for brand-new memberships; for updates (forced_status=None) we leave
+        # the existing status untouched so admin suspensions are not clobbered.
         member.member_role = member_role
-        member.status = resolved_status
+        if forced_status is not None:
+            member.status = forced_status
 
     # Keep the invited employee's system_role in sync with their org role.
     if profile is not None:
         if profile.system_role == SystemRole.BRAND_EMPLOYEE and member_role == MemberRole.OWNER and company.deleted_at is None:
             profile.system_role = SystemRole.BRAND_ADMIN
-        elif profile.system_role == SystemRole.BRAND_ADMIN and was_owner and (member_role != MemberRole.OWNER or resolved_status != MemberStatus.ACTIVE):
+        elif profile.system_role == SystemRole.BRAND_ADMIN and was_owner and (member_role != MemberRole.OWNER or member.status != MemberStatus.ACTIVE):
             is_owner_elsewhere_res = await db.execute(
                 select(
                     select(CompanyMember)

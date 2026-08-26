@@ -29,6 +29,23 @@ async def _clerk_delete(path: str) -> None:
             raise ClerkAPIError(f"Clerk DELETE {path} failed [{response.status_code}]: {response.text}")
 
 
+async def _clerk_patch(path: str, json_data: dict) -> None:
+    """
+    Issues an authenticated PATCH to the Clerk REST API.
+    Raises ClerkAPIError for non-2xx responses.
+    """
+    if not settings.clerk_secret_key:
+        raise ClerkAPIError("CLERK_SECRET_KEY is not configured")
+
+    url = f"{_CLERK_BASE}/{path}"
+    headers = {"Authorization": f"Bearer {settings.clerk_secret_key.get_secret_value()}"}
+
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        response = await client.patch(url, headers=headers, json=json_data)
+        if response.status_code not in (200, 201, 204):
+            raise ClerkAPIError(f"Clerk PATCH {path} failed [{response.status_code}]: {response.text}")
+
+
 async def delete_user(user_id: str) -> None:
     """Deletes a user from Clerk via their REST API."""
     safe_id = urllib.parse.quote(user_id, safe="")
@@ -46,4 +63,11 @@ async def remove_organization_membership(org_id: str, user_id: str) -> None:
     safe_org = urllib.parse.quote(org_id, safe="")
     safe_user = urllib.parse.quote(user_id, safe="")
     await _clerk_delete(f"organizations/{safe_org}/memberships/{safe_user}")
+
+
+async def update_organization_membership(org_id: str, user_id: str, role: str) -> None:
+    """Updates a user's role in an organization in Clerk via their REST API."""
+    safe_org = urllib.parse.quote(org_id, safe="")
+    safe_user = urllib.parse.quote(user_id, safe="")
+    await _clerk_patch(f"organizations/{safe_org}/memberships/{safe_user}", {"role": role})
 

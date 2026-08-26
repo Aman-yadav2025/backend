@@ -10,13 +10,18 @@ from app.models import (
     CompanyType,
     DiscountType,
     DocumentCategory,
+    MaterialType,
     DocumentStatus,
     MemberRole,
     MemberStatus,
     PackType,
     PaymentStatus,
+    PurchaseStatus,
+    ArrivalStatus,
+    InvoiceProofCategory,
     RefundRequestStatus,
     SystemRole,
+    WalletRechargeStatus,
 )
 
 
@@ -44,12 +49,26 @@ class CompanyOut(BaseModel):
     clerk_org_id: str
     owner_id: str
     name: str
-    gst_number: str | None
-    contact_person_name: str | None
+    company_email: str
+    mobile_number: str
+    gst_number: str
+    company_pan_number: str
+    factory_address: str
+    state: str
+    city: str
+    pincode: str
+    company_website: str | None
+    contact_person_name: str
     contact_person_email: str | None
+    designation: str
+    material: MaterialType
     company_type: CompanyType
     pack: PackType
     tier: int
+    epr_credits_available: int
+    epr_credits_required: int
+    wallet_balance: Decimal
+    frozen_wallet_balance: Decimal
     created_at: datetime
     updated_at: datetime
 
@@ -67,9 +86,19 @@ class CompanyEmployeeOut(BaseModel):
 
 class CompanyUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255, strip_whitespace=True)
+    company_email: EmailStr | None = Field(default=None)
+    mobile_number: str | None = Field(default=None, min_length=1, max_length=31, strip_whitespace=True)
     gst_number: str | None = Field(default=None, min_length=1, max_length=127, strip_whitespace=True)
+    company_pan_number: str | None = Field(default=None, min_length=10, max_length=10, strip_whitespace=True)
+    factory_address: str | None = Field(default=None, min_length=1, max_length=1024, strip_whitespace=True)
+    state: str | None = Field(default=None, min_length=1, max_length=127, strip_whitespace=True)
+    city: str | None = Field(default=None, min_length=1, max_length=127, strip_whitespace=True)
+    pincode: str | None = Field(default=None, min_length=1, max_length=31, strip_whitespace=True)
+    company_website: str | None = Field(default=None, max_length=2048, strip_whitespace=True)
     contact_person_name: str | None = Field(default=None, min_length=1, max_length=255, strip_whitespace=True)
     contact_person_email: EmailStr | None = Field(default=None)
+    designation: str | None = Field(default=None, min_length=1, max_length=255, strip_whitespace=True)
+    material: MaterialType | None = Field(default=None)
 
     @model_validator(mode="after")
     def validate_name_not_null(self) -> "CompanyUpdate":
@@ -102,6 +131,9 @@ class CompanyMemberOut(BaseModel):
 
 class CompanyMemberStatusUpdate(BaseModel):
     status: MemberStatus
+
+class CompanyMemberRoleUpdate(BaseModel):
+    member_role: MemberRole
 
 
 # ============================================================================
@@ -296,6 +328,10 @@ class RefundRequestCreate(BaseModel):
     amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
 
 
+class WalletRechargeRequest(BaseModel):
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+
+
 class RefundRequestOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -309,3 +345,510 @@ class RefundRequestOut(BaseModel):
     actioned_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+# ============================================================================
+# wallet_recharges
+# ============================================================================
+class WalletRechargeCheckoutRequest(BaseModel):
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+
+
+class WalletRechargeCheckoutResponse(BaseModel):
+    recharge_id: uuid.UUID
+    razorpay_order_id: str
+    razorpay_key_id: str
+    amount: Decimal
+    currency: str
+
+
+class WalletRechargeVerifyRequest(BaseModel):
+    razorpay_order_id: str = Field(min_length=1, strip_whitespace=True)
+    razorpay_payment_id: str = Field(min_length=1, strip_whitespace=True)
+    razorpay_signature: str = Field(min_length=1, strip_whitespace=True)
+
+
+class WalletRechargeOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    company_id: uuid.UUID
+    initiated_by_profile_id: str
+    razorpay_order_id: str
+    razorpay_payment_id: str | None
+    status: WalletRechargeStatus
+    amount: Decimal
+    currency: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class WalletBalanceOut(BaseModel):
+    """Lightweight response for wallet balance queries."""
+    company_id: uuid.UUID
+    wallet_balance: Decimal
+    frozen_wallet_balance: Decimal
+    available_balance: Decimal  # wallet_balance - frozen_wallet_balance
+
+
+# ============================================================================
+# KPIs
+# ============================================================================
+class TeamKPIs(BaseModel):
+    total_members: int
+    active_members: int
+    pending_invites: int
+
+
+class DocumentKPIs(BaseModel):
+    total_uploaded: int
+    pending_verification: int
+    verified: int
+    rejected: int
+
+
+class FinancialKPIs(BaseModel):
+    lifetime_spend_inr: Decimal
+    total_refunded_inr: Decimal
+    net_spend_inr: Decimal
+
+
+class CompanyDashboardKPIs(BaseModel):
+    company_id: uuid.UUID
+    pack: PackType
+    tier: int
+    team: TeamKPIs
+    documents: DocumentKPIs
+    financials: FinancialKPIs
+
+
+# ============================================================================
+# material_listings
+# ============================================================================
+class MaterialListingCreate(BaseModel):
+    """Payload a Recycler sends when posting a new material deal."""
+    material_type: MaterialType
+    category: str = Field(min_length=1, max_length=255, strip_whitespace=True)
+    grade: str = Field(min_length=1, max_length=127, strip_whitespace=True)
+    price_per_unit: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    total_quantity: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    # Optional invoice document (already uploaded via the presign flow).
+    # If omitted, the risk evaluator will set validity_risk = "HIGHEST RISK".
+    invoice_document_id: uuid.UUID | None = Field(
+        default=None,
+        description="ID of an already-uploaded document to use as the invoice for this deal.",
+    )
+    # Manual override for validity_risk — if provided AND no algorithm is running,
+    # this value is stored. The evaluator always runs last and may overwrite it.
+    validity_risk: str | None = Field(
+        default=None,
+        max_length=512,
+        strip_whitespace=True,
+        description="Overridden by the risk evaluator. Leave blank to auto-evaluate.",
+    )
+
+
+class MaterialListingUpdate(BaseModel):
+    """Partial update — only supplied fields are changed."""
+    category: str | None = Field(default=None, min_length=1, max_length=255, strip_whitespace=True)
+    grade: str | None = Field(default=None, min_length=1, max_length=127, strip_whitespace=True)
+    price_per_unit: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+    # total_quantity may only be increased (not decreased below already-sold amount).
+    # The endpoint enforces this constraint; schema just validates it's positive.
+    total_quantity: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+    validity_risk: str | None = Field(default=None, max_length=512, strip_whitespace=True)
+    is_active: bool | None = None
+
+
+class MaterialListingInvoiceAttach(BaseModel):
+    """Body for PATCH /{listing_id}/invoice — attach or replace the invoice."""
+    invoice_document_id: uuid.UUID = Field(
+        description="ID of an already-uploaded document to attach as the invoice."
+    )
+
+
+class MaterialListingOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    recycler_id: uuid.UUID | None = None
+    created_by_brand_id: uuid.UUID | None = None
+    offline_recycler_name: str | None = None
+    material_type: MaterialType  # ORM attribute name (maps to 'type' column)
+    category: str
+    grade: str
+    price_per_unit: Decimal
+    total_quantity: Decimal
+    available_quantity: Decimal
+    validity_risk: str | None = None
+    invoice_document_id: uuid.UUID | None = None
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+# ============================================================================
+# brand marketplace purchases
+# ============================================================================
+class MaterialPurchaseCreate(BaseModel):
+    """Payload a Brand sends when buying from a recycler's listing."""
+    quantity: Decimal = Field(
+        gt=0,
+        max_digits=12,
+        decimal_places=2,
+        description="Amount to purchase. Must not exceed the listing's available_quantity.",
+    )
+
+
+class MaterialPurchaseOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    listing_id: uuid.UUID
+    brand_id: uuid.UUID
+    category: str
+    purchased_quantity: Decimal
+    total_price: Decimal
+    # Breakdown of wallet impact
+    immediate_deduction: Decimal = Decimal("0.00")  # already debited; computed, not stored in ORM
+    pending_wallet_deduction: Decimal  # frozen; settled on delivery
+    purchase_type: str
+    purchase_status: PurchaseStatus
+    arrival_status: ArrivalStatus
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_orm_with_immediate(
+        cls,
+        purchase: "MaterialPurchaseOut",
+        immediate_deduction: Decimal,
+    ) -> "MaterialPurchaseOut":
+        """Convenience factory — ORM objects don't store immediate_deduction."""
+        data = cls.model_validate(purchase)
+        data.immediate_deduction = immediate_deduction
+        return data
+
+
+# ============================================================================
+# Brand Dashboard KPIs
+# ============================================================================
+class MaterialPurchaseBreakdownItem(BaseModel):
+    material_type: str
+    category: str
+    total_quantity: Decimal
+
+
+class MonthlyPurchaseTrendItem(BaseModel):
+    month: str  # Format: YYYY-MM
+    total_quantity: Decimal
+    average_rate: Decimal
+
+
+class TopRecyclerItem(BaseModel):
+    recycler_id: uuid.UUID
+    recycler_name: str
+    total_quantity: Decimal
+    total_value: Decimal
+
+
+
+class OrderStatusSummary(BaseModel):
+    delivered: int
+    processed: int
+    pending: int
+    canceled: int
+
+
+class EPRKPIs(BaseModel):
+    credits_available: int
+    credits_required: int
+
+
+class WalletTransactionItem(BaseModel):
+    transaction_id: str
+    date: datetime
+    amount: Decimal
+    is_credit: bool
+    payment_method: str
+    type: str
+    status: str
+
+class WalletKPIs(BaseModel):
+    current_balance: Decimal
+    pending_payments: Decimal
+    total_recharge: Decimal
+    total_spending: Decimal
+
+class DashboardPurchaseHistoryItem(BaseModel):
+    po_id: str
+    recycler_name: str
+    material_type: str
+    quantity: Decimal
+    rate: Decimal
+    total_value: Decimal
+    order_date: datetime
+    status: str
+
+class OfflineDealCreate(BaseModel):
+    recycler_name: str
+    material_type: MaterialType
+    category: str
+    grade: str
+    quantity: Decimal = Field(..., gt=0)
+    total_price: Decimal = Field(..., gt=0)
+    validity_risk: str | None = None
+    invoice_document_id: uuid.UUID | None = None
+
+class DashboardDealInvoiceItem(BaseModel):
+    invoice_no: str
+    date: datetime
+    recycler_name: str
+    category: str
+    quantity: Decimal
+    amount: Decimal
+    type: str
+    document_url: str | None
+
+class BrandDashboardKPIs(BaseModel):
+    company_id: uuid.UUID
+    material_purchased_breakdown: list[MaterialPurchaseBreakdownItem]
+    wallet_kpis: WalletKPIs
+    total_spend_inr: Decimal
+    avg_spend_per_mt: Decimal
+    epr: EPRKPIs
+    unique_recyclers_count: int
+    monthly_trend: list[MonthlyPurchaseTrendItem]
+    time_filtered_breakdown: list[MaterialPurchaseBreakdownItem]
+    top_recyclers: list[TopRecyclerItem]
+    order_status_summary: OrderStatusSummary
+    recent_purchases: list[DashboardPurchaseHistoryItem]
+    wallet_transactions: list[WalletTransactionItem]
+    deal_invoices: list[DashboardDealInvoiceItem]
+    offline_deals: list[DashboardDealInvoiceItem]
+
+
+# ============================================================================
+# Recycler Dashboard KPIs
+# ============================================================================
+class InvoiceStatsKPI(BaseModel):
+    total_uploaded: int
+    approved: int
+    pending: int
+    rejected: int
+
+class RecyclerMonthlySalesTrendItem(BaseModel):
+    month: str
+    amount_paid: Decimal
+    amount_pending: Decimal
+
+
+class RecyclerDealStatusSummary(BaseModel):
+    pending: int
+    processing: int
+    in_transit: int
+    delivered: int
+    cancelled: int
+
+
+class BrandDealBreakdownItem(BaseModel):
+    deal_id: str
+    buyer_name: str
+    buyer_contact_person: str
+    buyer_gst_number: str
+    buyer_mobile_number: str
+    buyer_email: str
+    buyer_address: str
+    date_of_deal: datetime
+    quantity: Decimal
+    amount: Decimal
+    status: str
+    invoice_url: str | None = None
+
+
+class CollectorDealBreakdownItem(BaseModel):
+    id: uuid.UUID
+    collector_name: str
+    material_type: str
+    quantity: Decimal
+    price: Decimal
+    document_url: str | None = None
+    created_at: datetime
+
+
+class RecyclerDashboardKPIs(BaseModel):
+    company_id: uuid.UUID
+    monthly_sales_trend: list[RecyclerMonthlySalesTrendItem]
+    deal_status_summary: RecyclerDealStatusSummary
+    brand_deals_breakdown: list[BrandDealBreakdownItem]
+    total_brand_deals_count: int
+    collector_deals_breakdown: list[CollectorDealBreakdownItem]
+    total_collector_deals_count: int
+    total_collector_spend: Decimal
+
+
+class CollectorSpendCategorySummaryItem(BaseModel):
+    category: str
+    material_type: str
+    total_spend: Decimal
+    total_quantity: Decimal
+
+
+class MonthlyCollectorSpendSummaryItem(BaseModel):
+    month: str
+    total_spend: Decimal
+    breakdown: list[CollectorSpendCategorySummaryItem]
+
+
+class CollectorSpendSummaryResponse(BaseModel):
+    monthly_summaries: list[MonthlyCollectorSpendSummaryItem]
+
+
+# ============================================================================
+# Collector Purchases
+# ============================================================================
+class CollectorPurchaseCreate(BaseModel):
+    collector_name: str = Field(min_length=1, strip_whitespace=True)
+    collector_company_name: str = Field(min_length=1, strip_whitespace=True)
+    mobile_number: str = Field(min_length=10, max_length=15, strip_whitespace=True)
+    gst_number: str | None = None
+    address: str = Field(min_length=1, strip_whitespace=True)
+    category: MaterialType
+    material_type: str = Field(min_length=1, strip_whitespace=True)
+    quantity: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    price: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+
+
+class CollectorPurchaseOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    recycler_id: uuid.UUID
+    collector_name: str
+    collector_company_name: str
+    mobile_number: str
+    gst_number: str | None
+    address: str
+    category: MaterialType
+    material_type: str
+    quantity: Decimal
+    price: Decimal
+    document_id: uuid.UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+# ============================================================================
+# Recycler Financial Reports
+# ============================================================================
+class RecyclerMonthlyMaterialPurchased(BaseModel):
+    category: str
+    material_type: str
+    total_quantity: Decimal
+    total_spend: Decimal
+
+
+class RecyclerMonthlyMaterialRecycled(BaseModel):
+    category: str
+    material_type: str
+    total_quantity: Decimal
+
+
+class RecyclerMonthlyReport(BaseModel):
+    month: str  # Format: YYYY-MM
+    material_purchased_from_collectors: list[RecyclerMonthlyMaterialPurchased]
+    material_recycled: list[RecyclerMonthlyMaterialRecycled]
+    sales_paid: Decimal
+    sales_pending: Decimal
+    revenue: Decimal
+
+
+class RecyclerFinancialReportResponse(BaseModel):
+    total_revenue_period: Decimal
+    total_sales_period: Decimal
+    total_sales_paid: Decimal
+    total_sales_pending: Decimal
+    total_material_recycled: Decimal
+    monthly_reports: list[RecyclerMonthlyReport]
+
+
+# ============================================================================
+# Recycler Wallet Review
+# ============================================================================
+class RecyclerWalletInvoiceItem(BaseModel):
+    invoice_no: str
+    company_name: str
+    amount: Decimal
+    date_of_deal: datetime
+    status: str
+    invoice_url: str
+
+
+class RecyclerWalletReview(BaseModel):
+    total_payment_received: Decimal
+    total_pending_amount: Decimal
+    total_invoices_count: int
+    invoices: list[RecyclerWalletInvoiceItem]
+
+
+# ============================================================================
+# Recycler Invoice Ledger
+# ============================================================================
+class InvoiceLedgerItem(BaseModel):
+    invoice_no: str
+    date: datetime
+    supplier: str
+    category: str
+    qty: Decimal
+    rate: Decimal
+    total: Decimal
+    action_url: str | None
+    deal_type: str
+
+
+class InvoiceLedgerResponse(BaseModel):
+    items: list[InvoiceLedgerItem]
+    total_count: int
+
+
+# ============================================================================
+# Invoice Proofs & Utility Metrics
+# ============================================================================
+class InvoiceProofCreate(BaseModel):
+    invoice_id: uuid.UUID
+    document_name: str
+    category: InvoiceProofCategory
+    period: str
+    unit_consumed: Decimal = Decimal("0.00")
+    amount_spent: Decimal = Decimal("0.00")
+    total_amount_used: Decimal = Decimal("0.00")
+    total_amount_recycled: Decimal = Decimal("0.00")
+    document_id: uuid.UUID | None = None
+
+
+class InvoiceProofOut(BaseModel):
+    id: uuid.UUID
+    invoice_id: uuid.UUID
+    document_name: str
+    category: InvoiceProofCategory
+    period: str
+    unit_consumed: Decimal
+    amount_spent: Decimal
+    total_amount_used: Decimal
+    total_amount_recycled: Decimal
+    document_id: uuid.UUID | None = None
+    document_url: str | None = None
+    created_at: datetime
+    
+    model_config = ConfigDict(from_attributes=True)
+
+class InvoiceProofListResponse(BaseModel):
+    items: list[InvoiceProofOut]
+    total_count: int
+
+
+class UtilityMetricsKPIs(BaseModel):
+    energy_output_ratio: Decimal
+    waybill_verified_scrap: Decimal
+    recorded_utility_invoices: Decimal
+    verified_proof_files: int

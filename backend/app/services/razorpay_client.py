@@ -52,9 +52,9 @@ def verify_webhook_signature(payload_body: bytes, received_signature: str) -> bo
 
 async def refund_payment(payment_id: str, amount_in_rupees: float, receipt: str) -> dict:
     """Initiates a refund via Razorpay API."""
-    # if payment_id.startswith("pay_dummy"):
-    #     import uuid
-    #     return {"id": f"rfnd_dummy_{uuid.uuid4().hex[:6]}"}
+    if payment_id.startswith("pay_dummy"):
+        import uuid
+        return {"id": f"rfnd_dummy_{uuid.uuid4().hex[:6]}"}
         
     amount_in_paise = int(round(amount_in_rupees * 100))
     def _refund():

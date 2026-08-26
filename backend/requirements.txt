@@ -10,3 +10,5 @@ razorpay>=1.4
 python-multipart>=0.0.9
 email-validator>=2.2
 requests>=2.32
+slowapi>=0.1.9
+redis>=5.0.0

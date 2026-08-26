@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     r2_presigned_url_expiry_seconds: int = 900
     r2_max_upload_bytes: int = 50 * 1024 * 1024  # 50 MB default cap
 
+    # --- Redis (rate limiter shared store) ------------------------------------
+    redis_url: str = "redis://localhost:6379"
 
     # --- App ---------------------------------------------------------------
     environment: str = "development"

@@ -2,6 +2,7 @@ import asyncio
 import uuid
 import sys
 import os
+import requests
 from datetime import datetime, timezone
 
 # Add the backend root directory to Python's path so it can find the 'app' module
@@ -13,11 +14,13 @@ from dotenv import dotenv_values
 env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 env = dotenv_values(env_path)
 
-# --- IMPORTANT ---
-# Fill these in before running!
 BASE_URL = "http://localhost:8000"
-USER_JWT = "eyJhbGciOiJSUzI1NiIsImNhdCI6ImNsX0I3ZDRQRDIyMkFBQSIsImtpZCI6Imluc18zSHpHVjhYa1BKMTdVblJyMmJTbFFkejN1SjAiLCJ0eXAiOiJKV1QifQ.eyJleHAiOjE3ODc0MzgxMjMsImlhdCI6MTc4NzM1MTcyMywiaXNzIjoiaHR0cHM6Ly9mbGV4aWJsZS1zd2luZS01NDExLmNsZXJrLmFjY291bnRzLmRldiIsImp0aSI6ImVhYTMxZGRjMmE2ZThkNDhhNTYzIiwibmJmIjoxNzg3MzUxNzE4LCJzdWIiOiJ1c2VyXzNJQksxMmhjSGhHMUpYZWFXakQ0TUw3UGNSUiJ9.M0Cykm8uqCZ8s2uYQnN8vFWVR85jsqvNVz7fwRb054IVUet8ZWdlN9zQ75atiqVrVvYVdLHYrjPQQDDtzTvikCW0C1JuXldAdIC5Lfxa0jfDWykp6pyLSayGqVQC_aVnwEciJ3GIcGPtDQLUe74uxEE1WxOmmCGzJlkyXR_tQLm7-qmH2mrXwPeMZh93pM_R_PZVaDsUZeyoTEIS0P-15ZIk-csKz1VfeIV1ObpK_I90wKpagJ3UMFqILWzPGNU-RNHqQ0bmx9YTXHy3aGZoUpyHFrcklcg_ZWIx1tzHTaWl1OooqS5fKP9gt5PWzoSSognbAypN-61loQrLxIdt_Q"         
-# -----------------
+CLERK_SECRET_KEY = env.get("CLERK_SECRET_KEY", "")
+CLERK_API_BASE = "https://api.clerk.com/v1"
+
+# Globals populated at runtime
+USER_JWT = ""
+USER_ID = ""
 
 def get_headers():
     return {
@@ -25,10 +28,38 @@ def get_headers():
         "Content-Type": "application/json"
     }
 
-def get_profile_id_from_jwt(jwt_token: str) -> str:
-    import jwt
-    decoded = jwt.decode(jwt_token, options={"verify_signature": False})
-    return decoded.get("sub")
+def provision_clerk_user() -> tuple[str, str]:
+    """Creates a temporary Clerk user and mints a session JWT for them."""
+    print("\n[Setup] Provisioning temporary Clerk admin user...")
+    headers = {"Authorization": f"Bearer {CLERK_SECRET_KEY}", "Content-Type": "application/json"}
+    
+    email = f"test_admin_{uuid.uuid4().hex[:8]}@example.com"
+    password = f"TestPass123!{uuid.uuid4().hex[:8]}"
+    resp = requests.post(f"{CLERK_API_BASE}/users", headers=headers, json={"email_address": [email], "password": password})
+    if not resp.ok:
+        print(f"❌ Failed to create Clerk user: {resp.text}")
+        sys.exit(1)
+    
+    clerk_user_id = resp.json()["id"]
+    print(f"✅ Created Clerk User: {clerk_user_id}")
+
+    resp = requests.post(f"{CLERK_API_BASE}/sessions", headers=headers, json={"user_id": clerk_user_id})
+    session_id = resp.json()["id"]
+
+    resp = requests.post(f"{CLERK_API_BASE}/sessions/{session_id}/tokens/dev_token", headers=headers, json={})
+    jwt = resp.json()["jwt"]
+    print("✅ Minted JWT successfully.")
+    return clerk_user_id, jwt
+
+def delete_clerk_user(clerk_user_id: str):
+    """Deletes the temporary Clerk user."""
+    print(f"\n[Teardown] Deleting Clerk user {clerk_user_id}...")
+    headers = {"Authorization": f"Bearer {CLERK_SECRET_KEY}"}
+    resp = requests.delete(f"{CLERK_API_BASE}/users/{clerk_user_id}", headers=headers)
+    if resp.ok:
+        print("✅ User deleted.")
+    else:
+        print(f"⚠️ Failed to delete user: {resp.text}")
 
 async def setup_admin_data():
     print("\n[Setup] Upgrading your profile to PLATFORM_ADMIN and seeding test data...")
@@ -36,12 +67,12 @@ async def setup_admin_data():
     from app.models import (
         Profile, SystemRole, Document, Payment, RefundRequest, 
         Company, CompanyType, PackType, DocumentCategory, DocumentStatus, 
-        PaymentStatus, RefundRequestStatus
+        PaymentStatus, RefundRequestStatus, MaterialType
     )
     
-    profile_id = get_profile_id_from_jwt(USER_JWT)
+    profile_id = USER_ID
     if not profile_id:
-        print("❌ Could not decode JWT to find your profile ID.")
+        print("❌ Profile ID is missing.")
         return None
         
     dummy_company_id = uuid.uuid4()
@@ -57,6 +88,10 @@ async def setup_admin_data():
     refund_req_approved_id = uuid.uuid4()
     refund_req_pending_id = uuid.uuid4()
     
+    # Exceeding Refund Test Data
+    payment_exceed_id = uuid.uuid4()
+    refund_req_exceed_id = uuid.uuid4()
+    
     async with AsyncSessionLocal() as db:
         # 1. Upgrade user to PLATFORM_ADMIN
         from sqlalchemy import select
@@ -64,10 +99,14 @@ async def setup_admin_data():
         profile = res.scalar_one_or_none()
         if profile:
             profile.system_role = SystemRole.PLATFORM_ADMIN
-            await db.commit()
         else:
-            print(f"❌ Could not find profile {profile_id} in DB.")
-            return None
+            profile = Profile(
+                id=profile_id,
+                email=f"{profile_id}@example.com",
+                system_role=SystemRole.PLATFORM_ADMIN
+            )
+            db.add(profile)
+        await db.commit()
             
         # 2. Dummy Company for relationships
         res_comp = await db.execute(select(Company).where(Company.owner_id == profile_id))
@@ -82,7 +121,22 @@ async def setup_admin_data():
                 name="Admin Test Corp",
                 company_type=CompanyType.BRAND,
                 pack=PackType.STARTER,
-                tier=1
+                tier=1,
+                wallet_balance=0, 
+                frozen_wallet_balance=0, 
+                gst_number="27AAAAA0000A1Z5", 
+                contact_person_name="Test Person", 
+                contact_person_email="test@person.com", 
+                company_email="test@company.com", 
+                mobile_number="9999999999", 
+                company_pan_number="ABCDE1234F", 
+                factory_address="123 Test St", 
+                state="Maharashtra", 
+                city="Mumbai", 
+                pincode="400001", 
+                company_website="https://test.com", 
+                designation="Manager",
+                material=MaterialType.METAL
             ))
             await db.commit()
         
@@ -165,6 +219,30 @@ async def setup_admin_data():
             status=RefundRequestStatus.PENDING
         ))
         
+        # 6. Data for Exceeding Refund (Payment=1000, Request=1500)
+        db.add(Payment(
+            id=payment_exceed_id,
+            company_id=dummy_company_id,
+            initiated_by_profile_id=profile_id,
+            razorpay_order_id=f"order_dummy_{payment_exceed_id.hex[:10]}",
+            razorpay_payment_id=f"pay_dummy_{payment_exceed_id.hex[:10]}",
+            status=PaymentStatus.SUCCESS,
+            original_amount=1000,
+            amount_paid=1000,
+            currency="INR",
+            plan_package=PackType.GROWTH,
+            plan_tier=1
+        ))
+        await db.commit()
+        
+        db.add(RefundRequest(
+            id=refund_req_exceed_id,
+            payment_id=payment_exceed_id,
+            requested_by_profile_id=profile_id,
+            amount=1500,
+            status=RefundRequestStatus.PENDING
+        ))
+        
         await db.commit()
         
     print("[Setup] Test admin data ready.")
@@ -173,6 +251,7 @@ async def setup_admin_data():
         "concurrent": [str(refund_req_1_id), str(refund_req_2_id)],
         "reset": str(refund_req_pending_id),
         "reset_payment_id": str(payment_reset_id),
+        "exceed_refund_req_id": str(refund_req_exceed_id),
         "profile_id": profile_id
     }
 
@@ -246,6 +325,20 @@ async def test_concurrent_refund_approvals(client: httpx.AsyncClient, data: dict
     else:
         print(f"❌ CRITICAL FAILURE! Expected exactly 1 success and 1 fail. Got: {success_count} successes, {fail_count} fails.")
 
+async def test_refund_exceeds_amount(client: httpx.AsyncClient, data: dict):
+    print("\n--- Testing Refund-Before-Call Validation ---")
+    req_id = data["exceed_refund_req_id"]
+    
+    resp = await client.post(
+        f"{BASE_URL}/admin/refund-requests/{req_id}/approve",
+        headers=get_headers()
+    )
+    
+    if resp.status_code == 400:
+        print("✅ Refund request exceeding amount correctly rejected with 400.")
+    else:
+        print(f"❌ Failed! Expected 400, got {resp.status_code}: {resp.text}")
+
 async def test_safe_payment_status_reset(client: httpx.AsyncClient, data: dict):
     print("\n--- Testing Safe Payment Status Reset ---")
     req_id = data["reset"]
@@ -282,18 +375,23 @@ async def test_safe_payment_status_reset(client: httpx.AsyncClient, data: dict):
 import json
 
 async def main():
-    if "PASTE_" in USER_JWT:
-        print("❌ Fill in USER_JWT at the top of the script first!")
-        return
+    global USER_JWT, USER_ID
+    USER_ID, USER_JWT = provision_clerk_user()
 
-    data = await setup_admin_data()
-    if not data:
-        return
-        
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        await test_document_verification_constraints(client, data)
-        await test_concurrent_refund_approvals(client, data)
-        await test_safe_payment_status_reset(client, data)
+    try:
+        data = await setup_admin_data()
+        if not data:
+            return
+            
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await test_document_verification_constraints(client, data)
+            await test_concurrent_refund_approvals(client, data)
+            await test_refund_exceeds_amount(client, data)
+            await test_safe_payment_status_reset(client, data)
+            
+        print("\n✅ All tests complete.")
+    finally:
+        delete_clerk_user(USER_ID)
 
 if __name__ == "__main__":
     asyncio.run(main())

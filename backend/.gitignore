@@ -174,3 +174,8 @@ cython_debug/
 
 # MacOS
 .DS_Store
+
+# Custom local and auto-generated files
+.venv-linux/
+.gemini/
+api.md

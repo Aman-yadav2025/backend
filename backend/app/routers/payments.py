@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,6 +10,7 @@ from app.config import settings
 from app.database import get_db
 from app.models import Company, CompanyMember, Payment, PaymentStatus, Profile, PromoCode, RefundRequest, RefundRequestStatus, MemberRole, MemberStatus
 from app.pricing import get_price_for
+from app.rate_limit import limiter
 from app.schemas import CheckoutRequest, CheckoutResponse, PaymentOut, PaymentVerifyRequest, RefundRequestCreate, RefundRequestOut
 from app.security import get_current_profile, require_company_admin
 from app.services import razorpay_client
@@ -51,7 +52,9 @@ def _compute_discount(promo: PromoCode, original_amount: float) -> float:
 
 
 @router.post("/checkout", response_model=CheckoutResponse)
+@limiter.limit("10/minute")  # Strict: prevents billing spam / Razorpay order flooding
 async def initiate_checkout(
+    request: Request,  # Required by SlowAPI to extract the client IP
     company_id: uuid.UUID,
     body: CheckoutRequest,
     admin_member: CompanyMember = Depends(require_company_admin),
@@ -211,7 +214,9 @@ async def list_payments(
 
 
 @router.post("/{payment_id}/refund-request", response_model=RefundRequestOut, status_code=201)
+@limiter.limit("10/minute")  # Strict: prevents refund request spam
 async def request_refund(
+    request: Request,  # Required by SlowAPI to extract the client IP
     company_id: uuid.UUID,
     payment_id: uuid.UUID,
     body: RefundRequestCreate,

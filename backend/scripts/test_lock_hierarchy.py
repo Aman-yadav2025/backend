@@ -19,27 +19,85 @@ import time
 import hmac
 import hashlib
 import base64
+import sys
+import os
+import uuid
+import requests
 import httpx
 from dotenv import dotenv_values
 
-# ── Config ────────────────────────────────────────────────────────────────────
-env = dotenv_values("c:/Users/amank/OneDrive/Desktop/production-app-root/backend/.env")
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-BASE_URL        = "http://localhost:8000"
-WEBHOOK_SECRET  = env.get("CLERK_WEBHOOK_SECRET")   # whsec_...
-USER_JWT        = "eyJhbGciOiJSUzI1NiIsImNhdCI6ImNsX0I3ZDRQRDIyMkFBQSIsImtpZCI6Imluc18zSHpHVjhYa1BKMTdVblJyMmJTbFFkejN1SjAiLCJ0eXAiOiJKV1QifQ.eyJleHAiOjE3ODc0MzM3NjUsImlhdCI6MTc4NzM0NzM2NSwiaXNzIjoiaHR0cHM6Ly9mbGV4aWJsZS1zd2luZS01NDExLmNsZXJrLmFjY291bnRzLmRldiIsImp0aSI6ImQzNTZmMjA4YTlmOTY0NTU4YWNkIiwibmJmIjoxNzg3MzQ3MzYwLCJzdWIiOiJ1c2VyXzNJRjVDZzdMa3ZxNlBxUkJ1TFZwQVE3SjdvbyJ9.s6i84WrFWu7gkveIwb9XjmysJAv4Vgu7hr7uqkcgmA90L2J2EPmd31iMcgBXZhHG6CWFFnQWtIm1gLXiBkIHRloVuL__lL0Ml4kIXNoCusayAESH2u7eQ53nmDIUTI87eMR00r7Ja0M-bc32g7hwWQoR3jSud6T8i1m8YZwNK0W78ty74Xqrdcd1s21uIfaRDJEH1blFht8MhEO3HaUZQ1wcW8-6A-IX4MNHPdbwb50DozvfdHRTuK4VIRrGCrjmv7nntPULpwKTN4-od1rTOJ65mm_FOMy2QXTPOMSTvx6rQoSHYUtMi-DMTSbhk5TfxFD4HD71voAQGuzwaKLfTw"                 # JWT for the user being deleted
-USER_ID         = "user_3IF5Cg7Lkvq6PqRBuLVpAQ7J7oo"             # e.g. user_2abc...
-ORG_ID          = "org_3IEvklmkiDmfY2dB0RtmeDxf534"              # e.g. org_2abc...
+from app.database import AsyncSessionLocal
+from app.models import Profile, SystemRole
+from sqlalchemy import delete
 
+env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+env = dotenv_values(env_path)
 
-# ── SVIX Webhook Signing ──────────────────────────────────────────────────────
+WEBHOOK_SECRET = env.get("CLERK_WEBHOOK_SECRET", "")
+CLERK_SECRET_KEY = env.get("CLERK_SECRET_KEY", "")
+CLERK_API_BASE = "https://api.clerk.com/v1"
+BASE_URL = "http://localhost:8000"
+
+# Globals populated at runtime
+USER_JWT = ""
+USER_ID = ""
+ORG_ID = f"org_{uuid.uuid4().hex[:10]}"
+
+def provision_clerk_user() -> tuple[str, str]:
+    """Creates a temporary Clerk user and mints a session JWT for them."""
+    print("\n[Setup] Provisioning temporary Clerk user...")
+    headers = {"Authorization": f"Bearer {CLERK_SECRET_KEY}", "Content-Type": "application/json"}
+    
+    email = f"test_lock_{uuid.uuid4().hex[:8]}@example.com"
+    password = f"TestPass123!{uuid.uuid4().hex[:8]}"
+    resp = requests.post(f"{CLERK_API_BASE}/users", headers=headers, json={"email_address": [email], "password": password})
+    if not resp.ok:
+        print(f"❌ Failed to create Clerk user: {resp.text}")
+        sys.exit(1)
+    
+    clerk_user_id = resp.json()["id"]
+    print(f"✅ Created Clerk User: {clerk_user_id}")
+
+    resp = requests.post(f"{CLERK_API_BASE}/sessions", headers=headers, json={"user_id": clerk_user_id})
+    session_id = resp.json()["id"]
+
+    resp = requests.post(f"{CLERK_API_BASE}/sessions/{session_id}/tokens/dev_token", headers=headers, json={})
+    jwt = resp.json()["jwt"]
+    print("✅ Minted JWT successfully.")
+    return clerk_user_id, jwt
+
+def delete_clerk_user(clerk_user_id: str):
+    """Deletes the temporary Clerk user."""
+    print(f"\n[Teardown] Deleting Clerk user {clerk_user_id}...")
+    headers = {"Authorization": f"Bearer {CLERK_SECRET_KEY}"}
+    resp = requests.delete(f"{CLERK_API_BASE}/users/{clerk_user_id}", headers=headers)
+    if resp.ok:
+        print("✅ User deleted.")
+    else:
+        print(f"❌ Failed to delete Clerk user: {resp.text}")
+
+async def setup_test_db():
+    print("\n[Setup] Seeding test profile in the database...")
+    async with AsyncSessionLocal() as db:
+        db.add(Profile(
+            id=USER_ID,
+            email=f"{USER_ID}@test.com",
+            system_role=SystemRole.BRAND_ADMIN,
+        ))
+        try:
+            await db.commit()
+            print("[Setup] Test profile ready.")
+        except Exception:
+            await db.rollback()
+            print("[Setup] Profile already exists (likely from webhook).")
+
 def sign_webhook(payload: dict, secret: str) -> dict:
-    """Generate valid Svix webhook headers for the given payload."""
     body        = json.dumps(payload, separators=(",", ":"))
     msg_id      = f"msg_{int(time.time()*1000)}"
     timestamp   = str(int(time.time()))
 
-    # Svix signs: "{msg_id}.{timestamp}.{body}"
     raw_secret  = base64.b64decode(secret.removeprefix("whsec_"))
     to_sign     = f"{msg_id}.{timestamp}.{body}".encode()
     signature   = base64.b64encode(
@@ -53,37 +111,17 @@ def sign_webhook(payload: dict, secret: str) -> dict:
         "svix-signature": f"v1,{signature}",
     }
 
-
-# ── Payloads ──────────────────────────────────────────────────────────────────
-user_deleted_payload = {
-    "type": "user.deleted",
-    "data": {"id": USER_ID, "deleted": True, "object": "user"},
-}
-
-org_membership_payload = {
-    "type": "organizationMembership.created",
-    "data": {
-        "organization":    {"id": ORG_ID},
-        "public_user_data": {"user_id": USER_ID},
-        "role":            "org:member",
-    },
-}
-
-
-# ── Concurrent Requests ───────────────────────────────────────────────────────
-async def send_user_deleted(client: httpx.AsyncClient):
-    headers  = sign_webhook(user_deleted_payload, WEBHOOK_SECRET)
-    body     = json.dumps(user_deleted_payload, separators=(",", ":"))
+async def send_user_deleted(client: httpx.AsyncClient, payload: dict):
+    headers  = sign_webhook(payload, WEBHOOK_SECRET)
+    body     = json.dumps(payload, separators=(",", ":"))
     response = await client.post(f"{BASE_URL}/webhooks/clerk", content=body, headers=headers)
     return ("user.deleted webhook", response.status_code, response.text)
 
-
-async def send_org_membership(client: httpx.AsyncClient):
-    headers  = sign_webhook(org_membership_payload, WEBHOOK_SECRET)
-    body     = json.dumps(org_membership_payload, separators=(",", ":"))
+async def send_org_membership(client: httpx.AsyncClient, payload: dict):
+    headers  = sign_webhook(payload, WEBHOOK_SECRET)
+    body     = json.dumps(payload, separators=(",", ":"))
     response = await client.post(f"{BASE_URL}/webhooks/clerk", content=body, headers=headers)
     return ("organizationMembership.created webhook", response.status_code, response.text)
-
 
 async def send_delete_profile(client: httpx.AsyncClient):
     response = await client.delete(
@@ -92,47 +130,74 @@ async def send_delete_profile(client: httpx.AsyncClient):
     )
     return ("DELETE /profiles/me", response.status_code, response.text)
 
-
 async def main():
+    global USER_JWT, USER_ID, ORG_ID
+    
     print("=" * 60)
     print("Distributed Lock Hierarchy Test")
     print("=" * 60)
 
-    if "PASTE_" in USER_JWT or "PASTE_" in USER_ID or "PASTE_" in ORG_ID:
-        print("\n❌  Fill in USER_JWT, USER_ID, ORG_ID at the top of this script first.")
+    if not CLERK_SECRET_KEY or not WEBHOOK_SECRET:
+        print("\n❌ Missing env vars.")
         return
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        # Fire all three at the exact same time
-        results = await asyncio.gather(
-            send_user_deleted(client),
-            send_org_membership(client),
-            send_delete_profile(client),
-            return_exceptions=True,
-        )
+    try:
+        USER_ID, USER_JWT = provision_clerk_user()
+        await setup_test_db()
+        
+        user_deleted_payload = {
+            "type": "user.deleted",
+            "data": {"id": USER_ID, "deleted": True, "object": "user"},
+        }
 
-    print("\nResults:")
-    print("-" * 60)
-    deadlock_found = False
-    for r in results:
-        if isinstance(r, Exception):
-            print(f"  EXCEPTION: {r}")
-            continue
-        label, status, body = r
-        flag = "✅" if status < 500 else "❌"
-        print(f"  {flag}  [{status}]  {label}")
-        if status >= 500:
-            print(f"       body: {body[:300]}")
-        if "DeadlockDetected" in body or "deadlock" in body.lower():
-            deadlock_found = True
-            print(f"       ⚠️  DEADLOCK DETECTED!")
+        org_membership_payload = {
+            "type": "organizationMembership.created",
+            "data": {
+                "organization":    {"id": ORG_ID},
+                "public_user_data": {"user_id": USER_ID},
+                "role":            "org:member",
+            },
+        }
 
-    print("-" * 60)
-    if deadlock_found:
-        print("\n❌  TEST FAILED — PostgreSQL deadlock detected.")
-    else:
-        print("\n✅  TEST PASSED — No deadlocks. All requests resolved.")
+        print("\n[Test] Firing concurrent requests...")
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            results = await asyncio.gather(
+                send_user_deleted(client, user_deleted_payload),
+                send_org_membership(client, org_membership_payload),
+                send_delete_profile(client),
+                return_exceptions=True,
+            )
 
+        print("\nResults:")
+        print("-" * 60)
+        deadlock_found = False
+        for r in results:
+            if isinstance(r, Exception):
+                print(f"  EXCEPTION: {r}")
+                continue
+            label, status, body = r
+            flag = "✅" if status < 500 else "❌"
+            print(f"  {flag}  [{status}]  {label}")
+            if status >= 500:
+                print(f"       body: {body[:3000]}")
+            if "DeadlockDetected" in body or "deadlock" in body.lower():
+                deadlock_found = True
+                print(f"       ⚠️  DEADLOCK DETECTED!")
+
+        print("-" * 60)
+        if deadlock_found:
+            print("\n❌  TEST FAILED — PostgreSQL deadlock detected.")
+        else:
+            print("\n✅  TEST PASSED — No deadlocks. All requests resolved.")
+            
+    finally:
+        if USER_ID:
+            print("\n[Teardown] Cleaning up database...")
+            async with AsyncSessionLocal() as db:
+                await db.execute(delete(Profile).where(Profile.id == USER_ID))
+                await db.commit()
+            delete_clerk_user(USER_ID)
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -8,25 +8,34 @@ going live. Amounts are in INR (rupees); conversion to paise happens in
 app/services/razorpay_client.py right before calling Razorpay.
 """
 
+from fastapi import HTTPException
 from app.models import PackType
 
 PRICING_MATRIX: dict[tuple[PackType, int], float] = {
-    (PackType.STARTER, 1): 4_999,
-    (PackType.STARTER, 2): 7_999,
-    (PackType.STARTER, 3): 10_999,
-    (PackType.STARTER, 4): 13_999,
-    (PackType.GROWTH, 1): 19_999,
-    (PackType.GROWTH, 2): 24_999,
-    (PackType.GROWTH, 3): 29_999,
-    (PackType.GROWTH, 4): 34_999,
-    (PackType.ENTERPRISE, 1): 49_999,
-    (PackType.ENTERPRISE, 2): 69_999,
-    (PackType.ENTERPRISE, 3): 89_999,
-    (PackType.ENTERPRISE, 4): 119_999,
+    # Tier 1 (< 100 MT/year)
+    (PackType.STARTER, 1): 45_000,
+    (PackType.GROWTH, 1): 95_000,
+    (PackType.ENTERPRISE, 1): 160_000,
+    
+    # Tier 2 (100–500 MT/year)
+    (PackType.STARTER, 2): 85_000,
+    (PackType.GROWTH, 2): 180_000,
+    (PackType.ENTERPRISE, 2): 320_000,
+    
+    # Tier 3 (500–2,000 MT/year)
+    (PackType.STARTER, 3): 150_000,
+    (PackType.GROWTH, 3): 310_000,
+    (PackType.ENTERPRISE, 3): 550_000,
 }
 
 
 def get_price_for(pack: PackType, tier: int) -> float:
+    if tier == 4:
+        raise HTTPException(
+            status_code=400, 
+            detail="Tier 4 (> 2,000 MT/year) requires custom enterprise pricing. Please contact sales to upgrade."
+        )
+        
     key = (pack, tier)
     if key not in PRICING_MATRIX:
         raise ValueError(f"No price configured for pack={pack.value} tier={tier}")
