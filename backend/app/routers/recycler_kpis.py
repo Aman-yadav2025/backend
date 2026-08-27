@@ -500,7 +500,7 @@ async def get_recycler_invoice_ledger(
         ).label("rate"),
         MaterialPurchase.total_price.label("total"),
         literal("SALE", type_=Text).label("deal_type"),
-        literal("", type_=Text).label("document_id") 
+        literal(None, type_=Text).label("document_id")
     ).select_from(MaterialPurchase).join(
         MaterialListing, MaterialPurchase.listing_id == MaterialListing.id
     ).join(
@@ -676,8 +676,8 @@ async def get_recycler_financial_report(
     for row in ml_res.all():
         months_data[row.month]["material_recycled"].append(
             RecyclerMonthlyMaterialRecycled(
-                category=row.material_type.value if hasattr(row.material_type, "value") else str(row.material_type),
-                material_type=row.category,
+                category=row.category.value if hasattr(row.category, "value") else str(row.category),
+                material_type=row.material_type,
                 total_quantity=row.total_quantity or Decimal("0")
             )
         )
@@ -747,7 +747,18 @@ async def create_invoice_proof(
     purchase = await db.get(CollectorPurchase, payload.invoice_id)
     if not purchase or purchase.recycler_id != company_id:
         raise HTTPException(status_code=404, detail="Collector Purchase not found")
-        
+
+    # Prevent duplicate proof for the same (collector purchase, category) pair
+    existing_proof = (await db.execute(
+        select(InvoiceProof).where(
+            InvoiceProof.invoice_id == payload.invoice_id,
+            InvoiceProof.recycler_id == company_id,
+            InvoiceProof.category == payload.category
+        )
+    )).scalar_one_or_none()
+    if existing_proof:
+        raise HTTPException(status_code=409, detail="An invoice proof for this category already exists for this collector purchase")
+
     if payload.document_id:
         doc = await db.get(Document, payload.document_id)
         if not doc or doc.company_id != company_id:
