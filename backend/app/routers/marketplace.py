@@ -34,12 +34,16 @@ from app.models import (
     CompanyType,
     Document,
     MaterialListing,
+    MaterialPurchase,
+    PurchaseStatus,
 )
 from app.schemas import (
     MaterialListingCreate,
     MaterialListingInvoiceAttach,
     MaterialListingOut,
     MaterialListingUpdate,
+    MaterialPurchaseOut,
+    ArrivalStatusUpdate,
 )
 from app.security import require_company_admin
 from app.services.risk_evaluator import evaluate_listing_risk
@@ -366,3 +370,54 @@ async def deactivate_listing(
     listing.is_active = False
     await db.commit()
     return {"message": "Listing deactivated successfully"}
+
+
+# ─── Update purchase arrival status ──────────────────────────────────────────
+
+@router.patch("/{listing_id}/purchases/{purchase_id}/arrival-status", response_model=MaterialPurchaseOut)
+async def update_purchase_arrival_status(
+    company_id: uuid.UUID,
+    listing_id: uuid.UUID,
+    purchase_id: uuid.UUID,
+    body: ArrivalStatusUpdate,
+    company: Company = Depends(_require_recycler_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Allows a Recycler to update the arrival status of a material deal (purchase).
+    """
+    # Find the listing to ensure the purchase belongs to this recycler
+    result = await db.execute(
+        select(MaterialListing).where(
+            MaterialListing.id == listing_id,
+            MaterialListing.recycler_id == company_id,
+        )
+    )
+    listing = result.scalar_one_or_none()
+    if listing is None:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    # Find the purchase and lock it for update
+    purchase_result = await db.execute(
+        select(MaterialPurchase).where(
+            MaterialPurchase.id == purchase_id,
+            MaterialPurchase.listing_id == listing_id,
+        ).with_for_update()
+    )
+    purchase = purchase_result.scalar_one_or_none()
+    if purchase is None:
+        raise HTTPException(status_code=404, detail="Purchase not found")
+
+    if purchase.purchase_status in (PurchaseStatus.AWAITING_PAYMENT, PurchaseStatus.CANCELLED):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot update arrival status: purchase is {purchase.purchase_status.value}.",
+        )
+
+    purchase.arrival_status = body.arrival_status
+    await db.commit()
+    await db.refresh(purchase)
+    
+    out = MaterialPurchaseOut.model_validate(purchase)
+    out.immediate_deduction = Decimal("0.00")
+    return out

@@ -22,6 +22,7 @@ from app.models import (
     RefundRequestStatus,
     SystemRole,
     WalletRechargeStatus,
+    PaymentMethod,
 )
 
 
@@ -498,6 +499,14 @@ class MaterialPurchaseCreate(BaseModel):
         decimal_places=2,
         description="Amount to purchase. Must not exceed the listing's available_quantity.",
     )
+    payment_method: PaymentMethod = Field(
+        default=PaymentMethod.DIRECT,
+        description="Payment method to use. Defaults to DIRECT."
+    )
+
+
+class ArrivalStatusUpdate(BaseModel):
+    arrival_status: ArrivalStatus
 
 
 class MaterialPurchaseOut(BaseModel):
@@ -514,6 +523,9 @@ class MaterialPurchaseOut(BaseModel):
     pending_wallet_deduction: Decimal  # frozen; settled on delivery
     purchase_type: str
     purchase_status: PurchaseStatus
+    payment_method: PaymentMethod
+    razorpay_order_id: str | None = None
+    razorpay_payment_id: str | None = None
     arrival_status: ArrivalStatus
     created_at: datetime
     updated_at: datetime

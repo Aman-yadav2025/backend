@@ -200,7 +200,7 @@ async def get_recycler_dashboard_kpis(
 
     # 5. Collector Deals Breakdown
     collector_base_query = (
-        select(CollectorPurchase, Document.storage_key.label("document_url"))
+        select(CollectorPurchase, Document.id.label("document_id"))
         .outerjoin(Document, CollectorPurchase.document_id == Document.id)
         .where(CollectorPurchase.recycler_id == company_id)
         .order_by(CollectorPurchase.created_at.desc())
@@ -227,7 +227,7 @@ async def get_recycler_dashboard_kpis(
             material_type=cp.material_type,
             quantity=cp.quantity,
             price=cp.price,
-            document_url=row.document_url,
+            document_url=f"/companies/{company_id}/documents/{row.document_id}/download" if row.document_id else None,
             created_at=cp.created_at
         ))
 
@@ -796,7 +796,7 @@ async def list_invoice_proofs(
     """
     # Base query joining Document to get storage_key (document_url)
     base_query = (
-        select(InvoiceProof, Document.storage_key.label("document_url"))
+        select(InvoiceProof, Document.id.label("document_id"))
         .outerjoin(Document, InvoiceProof.document_id == Document.id)
         .where(InvoiceProof.recycler_id == company_id)
     )
@@ -823,7 +823,7 @@ async def list_invoice_proofs(
             total_amount_used=proof.total_amount_used,
             total_amount_recycled=proof.total_amount_recycled,
             document_id=proof.document_id,
-            document_url=row.document_url,
+            document_url=f"/companies/{company_id}/documents/{row.document_id}/download" if row.document_id else None,
             created_at=proof.created_at
         ))
 

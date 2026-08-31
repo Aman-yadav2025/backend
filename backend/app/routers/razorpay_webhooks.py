@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Company, Payment, PaymentStatus, PromoCode, WalletRecharge, WalletRechargeStatus
+from app.models import Company, Payment, PaymentStatus, PromoCode, WalletRecharge, WalletRechargeStatus, MaterialPurchase, PurchaseStatus
 from app.services import razorpay_client
 
 router = APIRouter(prefix="/webhooks/razorpay", tags=["razorpay-webhooks"])
@@ -48,6 +48,13 @@ async def _get_recharge_for_order(db: AsyncSession, order_id: str) -> WalletRech
     return result.scalar_one_or_none()
 
 
+async def _get_deal_purchase_for_order(db: AsyncSession, order_id: str) -> MaterialPurchase | None:
+    result = await db.execute(
+        select(MaterialPurchase).where(MaterialPurchase.razorpay_order_id == order_id).with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
 async def _handle_order_paid(db: AsyncSession, event: dict) -> None:
     payload = event["payload"]
     order_entity = payload["order"]["entity"]
@@ -78,6 +85,21 @@ async def _handle_order_paid(db: AsyncSession, event: dict) -> None:
         company = company_result.scalar_one_or_none()
         if company is not None:
             company.wallet_balance += recharge.amount
+
+    elif purpose == "deal_purchase":
+        # ── Direct deal purchase order ───────────────────────────────────
+        purchase = await _get_deal_purchase_for_order(db, order_id)
+        if purchase is None:
+            # Orphaned order: the Razorpay order was created but the purchase
+            # row was never saved (e.g., stock ran out after order creation).
+            # Return 200 so Razorpay stops retrying — there is nothing to do.
+            return
+
+        if purchase.purchase_status in (PurchaseStatus.CONFIRMED, PurchaseStatus.CANCELLED):
+            return
+
+        purchase.razorpay_payment_id = payment_entity["id"]
+        purchase.purchase_status = PurchaseStatus.CONFIRMED
 
     else:
         # ── Subscription / plan payment order ────────────────────────────
@@ -127,6 +149,25 @@ async def _handle_payment_failed(db: AsyncSession, event: dict) -> None:
     if recharge is not None:
         if recharge.status == WalletRechargeStatus.PENDING.value:
             recharge.status = WalletRechargeStatus.FAILED.value
+        return
+
+    # Check if this is a direct deal purchase failure.
+    # IMPORTANT: do NOT cancel the purchase here. Razorpay fires payment.failed
+    # for each individual payment attempt, but the order remains open for retry
+    # until it expires (15 minutes). If we cancel + restore inventory here and
+    # the brand retries successfully, order.paid fires — but by then the purchase
+    # is CANCELLED so we silently ignore it, leaving the brand's money collected
+    # with no purchase record. Instead, let the brand cancel explicitly via the
+    # cancel API, or the order expires naturally with no further action needed.
+    #
+    # Use a plain (non-locking) read since we make no writes — holding a
+    # FOR UPDATE lock while doing nothing would block concurrent order.paid
+    # webhooks for the same purchase from acquiring their own lock.
+    deal_exists = await db.scalar(
+        select(MaterialPurchase.id).where(MaterialPurchase.razorpay_order_id == order_id)
+    )
+    if deal_exists is not None:
+        # Nothing to do on a single failed attempt — just acknowledge.
         return
 
     # Otherwise treat as a plan payment failure

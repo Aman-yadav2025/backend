@@ -372,7 +372,7 @@ async def get_deal_invoices(
             MaterialPurchase,
             MaterialListing,
             Company.name.label("recycler_name"),
-            Document.storage_key.label("document_url")
+            Document.id.label("document_id")
         )
         .join(MaterialListing, MaterialPurchase.listing_id == MaterialListing.id)
         .join(Company, MaterialListing.recycler_id == Company.id)
@@ -399,7 +399,7 @@ async def get_deal_invoices(
                 quantity=p.purchased_quantity,
                 amount=p.total_price,
                 type=l.validity_risk or "Unknown",
-                document_url=row.document_url
+                document_url=f"/companies/{company_id}/marketplace/purchases/{p.id}/invoice-download" if row.document_id else None
             )
         )
     return items
@@ -410,7 +410,7 @@ async def get_offline_deals(
     query = (
         select(
             MaterialListing,
-            Document.storage_key.label("document_url")
+            Document.id.label("document_id")
         )
         .outerjoin(Document, MaterialListing.invoice_document_id == Document.id)
         .where(MaterialListing.created_by_brand_id == company_id)
@@ -434,7 +434,7 @@ async def get_offline_deals(
                 quantity=l.total_quantity,
                 amount=l.price_per_unit * l.total_quantity,
                 type=l.validity_risk or "Unknown",
-                document_url=row.document_url
+                document_url=f"/companies/{company_id}/documents/{row.document_id}/download" if row.document_id else None
             )
         )
     return items

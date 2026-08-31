@@ -96,6 +96,7 @@ class MaterialType(str, enum.Enum):
 
 class PurchaseStatus(str, enum.Enum):
     PENDING = "PENDING"
+    AWAITING_PAYMENT = "AWAITING_PAYMENT"
     CONFIRMED = "CONFIRMED"
     CANCELLED = "CANCELLED"
 
@@ -109,6 +110,11 @@ class ArrivalStatus(str, enum.Enum):
 class CompanyType(str, enum.Enum):
     BRAND = "BRAND"
     RECYCLER = "RECYCLER"
+
+
+class PaymentMethod(str, enum.Enum):
+    WALLET = "WALLET"
+    DIRECT = "DIRECT"
 
 
 class PackType(str, enum.Enum):
@@ -398,6 +404,11 @@ class MaterialPurchase(Base):
     purchase_status: Mapped[PurchaseStatus] = mapped_column(
         _pg_enum(PurchaseStatus, "purchase_status"), default=PurchaseStatus.PENDING, nullable=False
     )
+    payment_method: Mapped[PaymentMethod] = mapped_column(
+        _pg_enum(PaymentMethod, "payment_method"), default=PaymentMethod.WALLET, nullable=False
+    )
+    razorpay_order_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    razorpay_payment_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     arrival_status: Mapped[ArrivalStatus] = mapped_column(
         _pg_enum(ArrivalStatus, "arrival_status"), default=ArrivalStatus.PENDING, nullable=False
     )
