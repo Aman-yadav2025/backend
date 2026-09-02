@@ -9,7 +9,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.config import settings
 from app.rate_limit import limiter
-from app.routers import admin, clerk_webhooks, companies, company_members, documents, kpis, marketplace, payments, promo_codes, razorpay_webhooks, profiles, brand_marketplace, recycler_kpis, collector_purchases
+from app.routers import admin, clerk_webhooks, companies, company_members, documents, kpis, marketplace, payments, promo_codes, razorpay_webhooks, profiles, brand_marketplace, recycler_kpis, collector_purchases, marketplace_overview, withdrawals
 app = FastAPI(title="Platform API", version="1.0.0")
 
 # ── Rate limiter state ────────────────────────────────────────────────────────
@@ -77,6 +77,8 @@ app.include_router(marketplace.router)
 app.include_router(brand_marketplace.router)
 app.include_router(recycler_kpis.router)
 app.include_router(collector_purchases.router)
+app.include_router(marketplace_overview.router)
+app.include_router(withdrawals.router)
 
 @app.get("/health")
 async def health_check():

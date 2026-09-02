@@ -43,6 +43,7 @@ from app.schemas import (
     InvoiceLedgerResponse,
     InvoiceLedgerItem,
     InvoiceProofCreate,
+    InvoiceProofUpdate,
     InvoiceProofOut,
     InvoiceProofListResponse,
     UtilityMetricsKPIs,
@@ -448,8 +449,8 @@ async def get_recycler_wallet_review(
 @router.get("/invoice-ledger", response_model=InvoiceLedgerResponse)
 async def get_recycler_invoice_ledger(
     company_id: uuid.UUID,
-    offset: int = Query(0, ge=0),
-    limit: int = Query(10, gt=0, le=100),
+    offset: int = 0,
+    limit: int | None = None,
     admin_member: CompanyMember = Depends(require_company_admin),
     db: AsyncSession = Depends(get_db),
 ):
@@ -508,7 +509,11 @@ async def get_recycler_invoice_ledger(
     data_query = select(union_subq).order_by(
         union_subq.c.created_at.desc(),
         union_subq.c.id.asc()
-    ).offset(offset).limit(limit)
+    )
+    if limit is not None:
+        data_query = data_query.limit(limit)
+    if offset > 0:
+        data_query = data_query.offset(offset)
     res = await db.execute(data_query)
     
     items = []
@@ -810,6 +815,118 @@ async def list_invoice_proofs(
         items=items,
         total_count=total_count
     )
+
+
+@router.patch("/invoice-proofs/{proof_id}", response_model=InvoiceProofOut)
+async def update_invoice_proof(
+    company_id: uuid.UUID,
+    proof_id: uuid.UUID,
+    payload: InvoiceProofUpdate,
+    admin_member: CompanyMember = Depends(require_company_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    # 1. Read without lock to get invoice_id
+    proof_info = (await db.execute(
+        select(InvoiceProof.invoice_id).where(
+            InvoiceProof.id == proof_id,
+            InvoiceProof.recycler_id == company_id,
+        )
+    )).first()
+    
+    if not proof_info:
+        raise HTTPException(status_code=404, detail="Invoice proof not found")
+
+    # 2. Lock the parent CollectorPurchase FIRST to prevent deadlocks and race conditions with POST
+    await db.execute(
+        select(CollectorPurchase).where(
+            CollectorPurchase.id == proof_info.invoice_id
+        ).with_for_update()
+    )
+
+    # 3. Now lock the proof for update (re-apply tenant filter defensively)
+    proof = (await db.execute(
+        select(InvoiceProof).where(
+            InvoiceProof.id == proof_id,
+            InvoiceProof.recycler_id == company_id,
+        ).with_for_update()
+    )).scalar_one()
+
+    if payload.document_id is not None:
+        doc = (await db.execute(
+            select(Document).where(
+                Document.id == payload.document_id,
+                Document.company_id == company_id,
+            )
+        )).scalar_one_or_none()
+        if not doc:
+            raise HTTPException(status_code=403, detail="Document not found or unauthorized")
+        proof.document_id = payload.document_id
+
+    if payload.document_name is not None:
+        proof.document_name = payload.document_name
+    if payload.category is not None and payload.category != proof.category:
+        existing_proof = (await db.execute(
+            select(InvoiceProof).where(
+                InvoiceProof.invoice_id == proof.invoice_id,
+                InvoiceProof.recycler_id == company_id,
+                InvoiceProof.category == payload.category
+            )
+        )).scalar_one_or_none()
+        if existing_proof:
+            raise HTTPException(status_code=409, detail="An invoice proof for this category already exists for this collector purchase")
+        proof.category = payload.category
+    if payload.period is not None:
+        proof.period = payload.period
+    if payload.unit_consumed is not None:
+        proof.unit_consumed = payload.unit_consumed
+    if payload.amount_spent is not None:
+        proof.amount_spent = payload.amount_spent
+    if payload.total_amount_used is not None:
+        proof.total_amount_used = payload.total_amount_used
+    if payload.total_amount_recycled is not None:
+        proof.total_amount_recycled = payload.total_amount_recycled
+
+    await db.commit()
+    await db.refresh(proof)
+
+    # Manually construct document_url — the ORM model has no computed field for this
+    return InvoiceProofOut(
+        id=proof.id,
+        invoice_id=proof.invoice_id,
+        document_name=proof.document_name,
+        category=proof.category,
+        period=proof.period,
+        unit_consumed=proof.unit_consumed,
+        amount_spent=proof.amount_spent,
+        total_amount_used=proof.total_amount_used,
+        total_amount_recycled=proof.total_amount_recycled,
+        document_id=proof.document_id,
+        document_url=f"/companies/{company_id}/documents/{proof.document_id}/download" if proof.document_id else None,
+        created_at=proof.created_at,
+    )
+
+
+@router.delete("/invoice-proofs/{proof_id}", status_code=204)
+async def delete_invoice_proof(
+    company_id: uuid.UUID,
+    proof_id: uuid.UUID,
+    admin_member: CompanyMember = Depends(require_company_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete an invoice proof."""
+    proof = (await db.execute(
+        select(InvoiceProof).where(
+            InvoiceProof.id == proof_id,
+            InvoiceProof.recycler_id == company_id,
+        ).with_for_update()
+    )).scalar_one_or_none()
+    
+    if not proof:
+        raise HTTPException(status_code=404, detail="Invoice proof not found")
+
+    await db.delete(proof)
+    await db.commit()
+    return None
 
 
 @router.get("/utility-metrics", response_model=UtilityMetricsKPIs)

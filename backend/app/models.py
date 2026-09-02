@@ -18,8 +18,10 @@ from sqlalchemy import (
     Index,
     text,
 )
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
+from typing import Any
 
 from app.database import Base
 
@@ -92,6 +94,12 @@ class WalletRechargeStatus(str, enum.Enum):
     PENDING = "PENDING"
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
+
+
+class WithdrawalStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
 
 
 class MaterialType(str, enum.Enum):
@@ -184,6 +192,14 @@ class Company(Base):
     contact_person_name: Mapped[str] = mapped_column(Text, nullable=False)
     contact_person_email: Mapped[str | None] = mapped_column(Text)
     designation: Mapped[str] = mapped_column(Text, nullable=False)
+    
+    # Recycler Profile specific fields (nullable)
+    established_year: Mapped[int | None] = mapped_column(Integer)
+    cpcb_id: Mapped[str | None] = mapped_column(Text)
+    monthly_plant_capacity_mt: Mapped[int | None] = mapped_column(Integer)
+    esg_rating: Mapped[int | None] = mapped_column(Integer)
+    dispatch_lead_time_days: Mapped[str | None] = mapped_column(Text)
+    
     material: Mapped[MaterialType] = mapped_column(_pg_enum(MaterialType, "material_type"), nullable=False)
     company_type: Mapped[CompanyType] = mapped_column(_pg_enum(CompanyType, "company_type"), nullable=False)
     pack: Mapped[PackType] = mapped_column(_pg_enum(PackType, "pack_type"), nullable=False)
@@ -384,6 +400,20 @@ class MaterialListing(Base):
         UUID(as_uuid=True), ForeignKey("documents.id", ondelete="SET NULL")
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # ── Technical Data Sheet (TDS) Fields ──
+    description: Mapped[str | None] = mapped_column(Text)
+    batch_inspection_report: Mapped[str | None] = mapped_column(Text)
+    min_order_quantity: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    carbon_reduction_per_kg: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    water_conservation_per_kg: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    accreditations: Mapped[list[str]] = mapped_column(
+        postgresql.ARRAY(Text), server_default="{}", default=list, nullable=False
+    )
+    technical_parameters: Mapped[dict[str, Any]] = mapped_column(
+        postgresql.JSONB, server_default="'{}'::jsonb", default=dict, nullable=False
+    )
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -543,4 +573,89 @@ class InvoiceProof(Base):
     __table_args__ = (
         Index("idx_invoice_proofs_recycler_id", "recycler_id"),
         Index("idx_invoice_proofs_invoice_id", "invoice_id"),
+    )
+
+
+class BankAccount(Base):
+    """A saved bank account or UPI destination belonging to a Recycler.
+
+    Constraint: either (account_number + ifsc_code + beneficiary_name)
+    OR upi_id must be populated — not neither.
+    """
+    __tablename__ = "bank_accounts"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id", ondelete="CASCADE"), nullable=False
+    )
+    # Bank transfer fields
+    beneficiary_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    account_number: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ifsc_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # UPI field
+    upi_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Reserved for future RazorpayX integration
+    razorpay_contact_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    razorpay_fund_account_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "(account_number IS NOT NULL AND ifsc_code IS NOT NULL AND beneficiary_name IS NOT NULL) "
+            "OR (upi_id IS NOT NULL)",
+            name="chk_bank_or_upi",
+        ),
+        Index("idx_bank_accounts_company", "company_id"),
+    )
+
+
+class WithdrawalRequest(Base):
+    """A withdrawal request made by a Recycler against their internal wallet.
+
+    Flow:
+      1. Recycler creates request  → wallet_balance -= amount,
+                                     frozen_wallet_balance += amount,
+                                     status = PENDING.
+      2a. Admin approves manually  → frozen_wallet_balance -= amount,
+                                      transaction_reference saved,
+                                      status = APPROVED.
+      2b. Admin rejects            → frozen_wallet_balance -= amount,
+                                      wallet_balance += amount (refund),
+                                      status = REJECTED.
+    """
+    __tablename__ = "withdrawal_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id", ondelete="RESTRICT"), nullable=False
+    )
+    bank_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bank_accounts.id", ondelete="RESTRICT"), nullable=False
+    )
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    status: Mapped[WithdrawalStatus] = mapped_column(
+        _pg_enum(WithdrawalStatus, "withdrawal_status"),
+        default=WithdrawalStatus.PENDING,
+        nullable=False,
+    )
+    # Admin fills this in when manually paying (UTR number, UPI ref, etc.)
+    transaction_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Audit trail
+    actioned_by: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True
+    )
+    actioned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="chk_withdrawal_positive"),
+        Index("idx_withdrawal_requests_company", "company_id"),
+        Index("idx_withdrawal_requests_status", "status"),
     )

@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from typing import Literal
+from typing import Literal, Any
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
@@ -23,6 +23,7 @@ from app.models import (
     SystemRole,
     WalletRechargeStatus,
     PaymentMethod,
+    WithdrawalStatus,
 )
 
 
@@ -62,6 +63,14 @@ class CompanyOut(BaseModel):
     contact_person_name: str
     contact_person_email: str | None
     designation: str
+    
+    # Recycler Profile fields
+    established_year: int | None = None
+    cpcb_id: str | None = None
+    monthly_plant_capacity_mt: int | None = None
+    esg_rating: int | None = None
+    dispatch_lead_time_days: str | None = None
+    
     material: MaterialType
     company_type: CompanyType
     pack: PackType
@@ -74,6 +83,24 @@ class CompanyOut(BaseModel):
     frozen_wallet_balance: Decimal
     created_at: datetime
     updated_at: datetime
+
+
+class RecyclerProfileOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    city: str
+    state: str
+    established_year: int | None = None
+    contact_person_name: str
+    mobile_number: str
+    company_email: str
+    gst_number: str
+    cpcb_id: str | None = None
+    monthly_plant_capacity_mt: int | None = None
+    esg_rating: int | None = None
+    dispatch_lead_time_days: str | None = None
 
 
 class CompanyEmployeeOut(BaseModel):
@@ -101,6 +128,13 @@ class CompanyUpdate(BaseModel):
     contact_person_name: str | None = Field(default=None, min_length=1, max_length=255, strip_whitespace=True)
     contact_person_email: EmailStr | None = Field(default=None)
     designation: str | None = Field(default=None, min_length=1, max_length=255, strip_whitespace=True)
+    
+    established_year: int | None = Field(default=None, ge=1800, le=2100)
+    cpcb_id: str | None = Field(default=None, max_length=255, strip_whitespace=True)
+    monthly_plant_capacity_mt: int | None = Field(default=None, ge=0)
+    esg_rating: int | None = Field(default=None, ge=0, le=100)
+    dispatch_lead_time_days: str | None = Field(default=None, max_length=255, strip_whitespace=True)
+    
     material: MaterialType | None = Field(default=None)
 
     @model_validator(mode="after")
@@ -473,6 +507,14 @@ class MaterialListingCreate(BaseModel):
         strip_whitespace=True,
         description="Overridden by the risk evaluator. Leave blank to auto-evaluate.",
     )
+    # ── Technical Data Sheet (TDS) Fields ──
+    description: str | None = Field(default=None, description="Detailed text description of the material.")
+    batch_inspection_report: str | None = Field(default=None, max_length=255)
+    min_order_quantity: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+    carbon_reduction_per_kg: Decimal | None = Field(default=None, max_digits=12, decimal_places=2)
+    water_conservation_per_kg: Decimal | None = Field(default=None, max_digits=12, decimal_places=2)
+    accreditations: list[str] = Field(default_factory=list)
+    technical_parameters: dict[str, Any] = Field(default_factory=dict)
 
 
 class MaterialListingUpdate(BaseModel):
@@ -485,6 +527,15 @@ class MaterialListingUpdate(BaseModel):
     total_quantity: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
     validity_risk: str | None = Field(default=None, max_length=512, strip_whitespace=True)
     is_active: bool | None = None
+    
+    # ── Technical Data Sheet (TDS) Fields ──
+    description: str | None = None
+    batch_inspection_report: str | None = Field(default=None, max_length=255)
+    min_order_quantity: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+    carbon_reduction_per_kg: Decimal | None = Field(default=None, max_digits=12, decimal_places=2)
+    water_conservation_per_kg: Decimal | None = Field(default=None, max_digits=12, decimal_places=2)
+    accreditations: list[str] | None = None
+    technical_parameters: dict[str, Any] | None = None
 
 
 class MaterialListingInvoiceAttach(BaseModel):
@@ -510,6 +561,21 @@ class MaterialListingOut(BaseModel):
     validity_risk: str | None = None
     invoice_document_id: uuid.UUID | None = None
     is_active: bool
+    
+    # ── Technical Data Sheet (TDS) Fields ──
+    description: str | None = None
+    batch_inspection_report: str | None = None
+    min_order_quantity: Decimal | None = None
+    carbon_reduction_per_kg: Decimal | None = None
+    water_conservation_per_kg: Decimal | None = None
+    accreditations: list[str] | None = Field(default_factory=list)
+    technical_parameters: dict[str, Any] | None = Field(default_factory=dict)
+    
+    # ── Nested/Joined Fields ──
+    recycler_name: str | None = None
+    recycler_city: str | None = None
+    recycler_state: str | None = None
+
     created_at: datetime
     updated_at: datetime
 
@@ -908,6 +974,17 @@ class InvoiceProofCreate(BaseModel):
     document_id: uuid.UUID | None = None
 
 
+class InvoiceProofUpdate(BaseModel):
+    document_name: str | None = None
+    category: InvoiceProofCategory | None = None
+    period: str | None = None
+    unit_consumed: Decimal | None = None
+    amount_spent: Decimal | None = None
+    total_amount_used: Decimal | None = None
+    total_amount_recycled: Decimal | None = None
+    document_id: uuid.UUID | None = None
+
+
 class InvoiceProofOut(BaseModel):
     id: uuid.UUID
     invoice_id: uuid.UUID
@@ -934,3 +1011,82 @@ class UtilityMetricsKPIs(BaseModel):
     waybill_verified_scrap: Decimal
     recorded_utility_invoices: Decimal
     verified_proof_files: int
+
+
+# ============================================================================
+# Marketplace Overview
+# ============================================================================
+class MarketplaceOverviewStats(BaseModel):
+    total_volume_available: Decimal
+    total_active_listings: int
+    avg_price_plastic: Decimal
+    avg_price_metal: Decimal
+    total_recyclers: int
+
+
+# ============================================================================
+# Withdrawals
+# ============================================================================
+
+class BankAccountCreate(BaseModel):
+    """Create a new bank account or UPI payout destination.
+    Either (account_number + ifsc_code + beneficiary_name) or upi_id must be provided.
+    """
+    beneficiary_name: str | None = None
+    account_number: str | None = None
+    ifsc_code: str | None = None
+    upi_id: str | None = None
+
+    @model_validator(mode="after")
+    def check_bank_or_upi(self) -> "BankAccountCreate":
+        has_bank = (
+            self.account_number is not None
+            and self.ifsc_code is not None
+            and self.beneficiary_name is not None
+        )
+        has_upi = self.upi_id is not None
+        if not has_bank and not has_upi:
+            raise ValueError(
+                "Provide either (beneficiary_name + account_number + ifsc_code) for bank transfer, "
+                "or upi_id for UPI transfer."
+            )
+        return self
+
+
+class BankAccountOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    company_id: uuid.UUID
+    beneficiary_name: str | None = None
+    account_number: str | None = None
+    ifsc_code: str | None = None
+    upi_id: str | None = None
+    created_at: datetime
+
+
+class WithdrawalRequestCreate(BaseModel):
+    bank_account_id: uuid.UUID
+    amount: Decimal = Field(gt=0, description="Amount to withdraw in INR")
+
+
+class WithdrawalRequestOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    company_id: uuid.UUID
+    bank_account_id: uuid.UUID
+    amount: Decimal
+    status: WithdrawalStatus
+    transaction_reference: str | None = None
+    actioned_by: str | None = None
+    actioned_at: datetime | None = None
+    created_at: datetime
+
+
+class WithdrawalApproveRequest(BaseModel):
+    """Body required when an admin manually approves a withdrawal."""
+    transaction_reference: str = Field(
+        min_length=3,
+        description="UTR number, UPI transaction ID, or other reference for the manual payment",
+    )

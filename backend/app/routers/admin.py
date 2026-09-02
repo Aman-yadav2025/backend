@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import (
+    BankAccount,
+    Company,
     Document,
     DocumentStatus,
     Payment,
@@ -17,8 +19,18 @@ from app.models import (
     RefundRequest,
     RefundRequestStatus,
     SystemRole,
+    WithdrawalRequest,
+    WithdrawalStatus,
 )
-from app.schemas import DocumentOut, DocumentVerifyRequest, RefundRequestOut, ProfileOut
+from app.schemas import (
+    BankAccountOut,
+    DocumentOut,
+    DocumentVerifyRequest,
+    ProfileOut,
+    RefundRequestOut,
+    WithdrawalApproveRequest,
+    WithdrawalRequestOut,
+)
 from app.security import require_platform_admin
 from app.services import razorpay_client
 
@@ -261,3 +273,162 @@ async def create_platform_admin(
     await db.commit()
     await db.refresh(profile)
     return profile
+
+
+# ---------------------------------------------------------------------------
+# Admin: List all withdrawal requests
+# ---------------------------------------------------------------------------
+@router.get("/withdrawals", response_model=list[WithdrawalRequestOut])
+async def list_withdrawal_requests(
+    status: WithdrawalStatus | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    admin: Profile = Depends(require_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lists all withdrawal requests across the platform.
+    Optionally filter by status (PENDING, APPROVED, REJECTED).
+    """
+    query = select(WithdrawalRequest).order_by(WithdrawalRequest.created_at.desc())
+    if status is not None:
+        query = query.where(WithdrawalRequest.status == status)
+    query = query.limit(limit).offset(offset)
+    result = await db.execute(query)
+    return result.scalars().all()
+
+
+# ---------------------------------------------------------------------------
+# Admin: Approve a withdrawal request
+# (Admin has manually paid the recycler and is logging the reference)
+# ---------------------------------------------------------------------------
+@router.post("/withdrawals/{withdrawal_id}/approve", response_model=WithdrawalRequestOut)
+async def approve_withdrawal(
+    withdrawal_id: uuid.UUID,
+    body: WithdrawalApproveRequest,
+    admin: Profile = Depends(require_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Mark a PENDING withdrawal as APPROVED.
+
+    The admin must have already manually paid the recycler (via bank
+    transfer or UPI) and provides the transaction reference (UTR/UPI ref)
+    as proof. The frozen amount is permanently cleared from the recycler's
+    frozen_wallet_balance.
+    """
+    # ── 1. Lock withdrawal row ────────────────────────────────────────────────
+    withdrawal = await db.scalar(
+        select(WithdrawalRequest)
+        .where(WithdrawalRequest.id == withdrawal_id)
+        .with_for_update()
+    )
+    if withdrawal is None:
+        raise HTTPException(status_code=404, detail="Withdrawal request not found")
+    if withdrawal.status != WithdrawalStatus.PENDING:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only PENDING withdrawals can be approved (current status: {withdrawal.status.value}).",
+        )
+
+    # ── 2. Lock company row and clear the frozen amount ───────────────────────
+    company = await db.scalar(
+        select(Company).where(Company.id == withdrawal.company_id).with_for_update()
+    )
+    if company is None:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    # Safety guard: frozen balance should always cover the amount, but defend
+    # against manual DB corrections that might have reduced it.
+    if company.frozen_wallet_balance < withdrawal.amount:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Frozen balance (₹{company.frozen_wallet_balance:.2f}) is less than "
+                f"the withdrawal amount (₹{withdrawal.amount:.2f}). "
+                "Please correct the balance before approving."
+            ),
+        )
+    if company.wallet_balance < withdrawal.amount:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Total wallet balance (₹{company.wallet_balance:.2f}) is less than "
+                f"the withdrawal amount (₹{withdrawal.amount:.2f}). "
+                "Please correct the balance before approving."
+            ),
+        )
+
+    # The money has left the platform: remove it from both frozen and total wallet.
+    company.frozen_wallet_balance -= withdrawal.amount
+    company.wallet_balance -= withdrawal.amount
+
+    # ── 3. Mark as approved ───────────────────────────────────────────────────
+    withdrawal.status = WithdrawalStatus.APPROVED
+    withdrawal.transaction_reference = body.transaction_reference
+    withdrawal.actioned_by = admin.id
+    withdrawal.actioned_at = datetime.now(timezone.utc)
+
+    await db.commit()
+    await db.refresh(withdrawal)
+    return withdrawal
+
+
+# ---------------------------------------------------------------------------
+# Admin: Reject a withdrawal request
+# (Funds are returned to the recycler's spendable wallet_balance)
+# ---------------------------------------------------------------------------
+@router.post("/withdrawals/{withdrawal_id}/reject", response_model=WithdrawalRequestOut)
+async def reject_withdrawal(
+    withdrawal_id: uuid.UUID,
+    admin: Profile = Depends(require_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Reject a PENDING withdrawal and refund the amount back to the
+    recycler's active wallet_balance.
+    """
+    # ── 1. Lock withdrawal row ────────────────────────────────────────────────
+    withdrawal = await db.scalar(
+        select(WithdrawalRequest)
+        .where(WithdrawalRequest.id == withdrawal_id)
+        .with_for_update()
+    )
+    if withdrawal is None:
+        raise HTTPException(status_code=404, detail="Withdrawal request not found")
+    if withdrawal.status != WithdrawalStatus.PENDING:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only PENDING withdrawals can be rejected (current status: {withdrawal.status.value}).",
+        )
+
+    # ── 2. Lock company row and restore the funds ─────────────────────────────
+    company = await db.scalar(
+        select(Company).where(Company.id == withdrawal.company_id).with_for_update()
+    )
+    if company is None:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    # Safety guard: frozen balance should always cover the amount, but defend
+    # against manual DB corrections that might have reduced it.
+    if company.frozen_wallet_balance < withdrawal.amount:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Frozen balance (₹{company.frozen_wallet_balance:.2f}) is less than "
+                f"the withdrawal amount (₹{withdrawal.amount:.2f}). "
+                "Please correct the balance before rejecting."
+            ),
+        )
+
+    # Unfreeze the amount (wallet_balance was never reduced, so we just unfreeze it)
+    company.frozen_wallet_balance -= withdrawal.amount
+
+    # ── 3. Mark as rejected ───────────────────────────────────────────────────
+    withdrawal.status = WithdrawalStatus.REJECTED
+    withdrawal.actioned_by = admin.id
+    withdrawal.actioned_at = datetime.now(timezone.utc)
+
+    await db.commit()
+    await db.refresh(withdrawal)
+    return withdrawal

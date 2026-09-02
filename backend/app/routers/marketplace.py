@@ -137,6 +137,12 @@ async def create_listing(
     if body.invoice_document_id is not None:
         await _validate_invoice_doc(body.invoice_document_id, company_id, db)
 
+    if body.min_order_quantity is not None and body.min_order_quantity > body.total_quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Minimum order quantity ({body.min_order_quantity}) cannot exceed total quantity ({body.total_quantity})."
+        )
+
     listing = MaterialListing(
         recycler_id=company_id,
         material_type=body.material_type,
@@ -147,6 +153,13 @@ async def create_listing(
         available_quantity=body.total_quantity,  # nothing sold yet
         invoice_document_id=body.invoice_document_id,
         validity_risk=body.validity_risk,
+        description=body.description,
+        batch_inspection_report=body.batch_inspection_report,
+        min_order_quantity=body.min_order_quantity,
+        carbon_reduction_per_kg=body.carbon_reduction_per_kg,
+        water_conservation_per_kg=body.water_conservation_per_kg,
+        accreditations=body.accreditations,
+        technical_parameters=body.technical_parameters,
         is_active=True,
     )
     db.add(listing)
@@ -157,7 +170,12 @@ async def create_listing(
 
     await db.commit()
     await db.refresh(listing)
-    return listing
+    
+    out = MaterialListingOut.model_validate(listing)
+    out.recycler_name = company.name
+    out.recycler_city = company.city
+    out.recycler_state = company.state
+    return out
 
 
 # ─── List own listings ────────────────────────────────────────────────────────
@@ -166,6 +184,8 @@ async def create_listing(
 async def list_listings(
     company_id: uuid.UUID,
     include_inactive: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
     _admin: CompanyMember = Depends(require_company_admin),
     db: AsyncSession = Depends(get_db),
 ):
@@ -181,13 +201,36 @@ async def list_listings(
     if company.company_type != CompanyType.RECYCLER:
         raise HTTPException(status_code=403, detail="Only RECYCLER companies can access this resource")
 
-    q = select(MaterialListing).where(MaterialListing.recycler_id == company_id)
+    q = select(
+        MaterialListing,
+        Company.name.label("recycler_name"),
+        Company.city.label("recycler_city"),
+        Company.state.label("recycler_state")
+    ).outerjoin(Company, MaterialListing.recycler_id == Company.id)
+    
+    q = q.where(MaterialListing.recycler_id == company_id)
     if not include_inactive:
         q = q.where(MaterialListing.is_active.is_(True))
     q = q.order_by(MaterialListing.created_at.desc())
+    
+    if limit is not None:
+        q = q.limit(limit)
+    if offset > 0:
+        q = q.offset(offset)
 
     result = await db.execute(q)
-    return result.scalars().all()
+    rows = result.all()
+    
+    out_list = []
+    for row in rows:
+        listing = row.MaterialListing
+        out = MaterialListingOut.model_validate(listing)
+        out.recycler_name = row.recycler_name
+        out.recycler_city = row.recycler_city
+        out.recycler_state = row.recycler_state
+        out_list.append(out)
+        
+    return out_list
 
 
 # ─── Get single listing ───────────────────────────────────────────────────────
@@ -209,15 +252,27 @@ async def get_listing(
     if company.company_type != CompanyType.RECYCLER:
         raise HTTPException(status_code=403, detail="Only RECYCLER companies can access this resource")
 
-    listing = await db.scalar(
-        select(MaterialListing).where(
-            MaterialListing.id == listing_id,
-            MaterialListing.recycler_id == company_id,
-        )
+    q = select(
+        MaterialListing,
+        Company.name.label("recycler_name"),
+        Company.city.label("recycler_city"),
+        Company.state.label("recycler_state")
+    ).outerjoin(Company, MaterialListing.recycler_id == Company.id).where(
+        MaterialListing.id == listing_id,
+        MaterialListing.recycler_id == company_id,
     )
-    if listing is None:
+    result = await db.execute(q)
+    row = result.first()
+    
+    if row is None:
         raise HTTPException(status_code=404, detail="Listing not found")
-    return listing
+        
+    out = MaterialListingOut.model_validate(row.MaterialListing)
+    out.recycler_name = row.recycler_name
+    out.recycler_city = row.recycler_city
+    out.recycler_state = row.recycler_state
+    
+    return out
 
 
 # ─── Attach / replace invoice ─────────────────────────────────────────────────
@@ -267,7 +322,12 @@ async def attach_invoice(
 
     await db.commit()
     await db.refresh(listing)
-    return listing
+    
+    out = MaterialListingOut.model_validate(listing)
+    out.recycler_name = company.name
+    out.recycler_city = company.city
+    out.recycler_state = company.state
+    return out
 
 
 # ─── Update listing ───────────────────────────────────────────────────────────
@@ -299,44 +359,67 @@ async def update_listing(
     if listing is None:
         raise HTTPException(status_code=404, detail="Listing not found")
 
-    if body.category is not None:
-        listing.category = body.category
+    update_data = body.model_dump(exclude_unset=True)
+    
+    if "category" in update_data:
+        listing.category = update_data["category"]
+    if "grade" in update_data:
+        listing.grade = update_data["grade"]
+    if "price_per_unit" in update_data:
+        listing.price_per_unit = update_data["price_per_unit"]
 
-    if body.grade is not None:
-        listing.grade = body.grade
-
-    if body.price_per_unit is not None:
-        listing.price_per_unit = body.price_per_unit
-
-    if body.total_quantity is not None:
+    if "total_quantity" in update_data:
         sold_quantity: Decimal = listing.total_quantity - listing.available_quantity
-        if body.total_quantity < sold_quantity:
+        if update_data["total_quantity"] < sold_quantity:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Cannot set total_quantity to {body.total_quantity} — "
+                    f"Cannot set total_quantity to {update_data['total_quantity']} — "
                     f"{sold_quantity} units are already sold."
                 ),
             )
-        listing.available_quantity = body.total_quantity - sold_quantity
-        listing.total_quantity = body.total_quantity
+        listing.available_quantity = update_data["total_quantity"] - sold_quantity
+        listing.total_quantity = update_data["total_quantity"]
 
-    if body.validity_risk is not None:
-        # Manual override is allowed ONLY when invoice is present —
-        # without invoice the risk is always HIGHEST RISK.
+    if "validity_risk" in update_data:
         if listing.invoice_document_id is None:
             raise HTTPException(
                 status_code=400,
                 detail="Cannot override validity_risk without an invoice. Attach an invoice first.",
             )
-        listing.validity_risk = body.validity_risk
+        listing.validity_risk = update_data["validity_risk"]
 
-    if body.is_active is not None:
-        listing.is_active = body.is_active
+    if "description" in update_data:
+        listing.description = update_data["description"]
+    if "batch_inspection_report" in update_data:
+        listing.batch_inspection_report = update_data["batch_inspection_report"]
+    if "min_order_quantity" in update_data:
+        listing.min_order_quantity = update_data["min_order_quantity"]
+    if "carbon_reduction_per_kg" in update_data:
+        listing.carbon_reduction_per_kg = update_data["carbon_reduction_per_kg"]
+    if "water_conservation_per_kg" in update_data:
+        listing.water_conservation_per_kg = update_data["water_conservation_per_kg"]
+    if "accreditations" in update_data:
+        listing.accreditations = update_data["accreditations"]
+    if "technical_parameters" in update_data:
+        listing.technical_parameters = update_data["technical_parameters"]
+    if "is_active" in update_data:
+        listing.is_active = update_data["is_active"]
+
+    if listing.min_order_quantity is not None and listing.min_order_quantity > listing.total_quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Minimum order quantity ({listing.min_order_quantity}) cannot exceed total quantity ({listing.total_quantity})."
+        )
 
     await db.commit()
     await db.refresh(listing)
-    return listing
+    
+    out = MaterialListingOut.model_validate(listing)
+    out.recycler_name = company.name
+    out.recycler_city = company.city
+    out.recycler_state = company.state
+    return out
 
 
 # ─── Deactivate (soft delete) listing ────────────────────────────────────────

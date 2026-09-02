@@ -263,7 +263,7 @@ async def get_monthly_trend(
 
 
 async def get_top_recyclers(
-    db: AsyncSession, company_id: uuid.UUID, offset: int = 0, limit: int = 5
+    db: AsyncSession, company_id: uuid.UUID, offset: int = 0, limit: int | None = None
 ) -> list[TopRecyclerItem]:
     query = (
         select(
@@ -281,9 +281,13 @@ async def get_top_recyclers(
         )
         .group_by(MaterialListing.recycler_id, Company.name)
         .order_by(func.sum(MaterialPurchase.purchased_quantity).desc())
-        .offset(offset)
-        .limit(limit)
     )
+    
+    if limit is not None:
+        query = query.limit(limit)
+    if offset > 0:
+        query = query.offset(offset)
+        
     
     result = await db.execute(query)
     rows = result.all()
@@ -525,8 +529,8 @@ async def get_brand_dashboard_kpis(
     purchase_history_limit: int = Query(10, gt=0, le=100),
     wallet_history_offset: int = Query(0, ge=0),
     wallet_history_limit: int = Query(10, gt=0, le=100),
-    top_recyclers_offset: int = Query(0, ge=0),
-    top_recyclers_limit: int = Query(5, gt=0, le=50),
+    top_recyclers_offset: int = 0,
+    top_recyclers_limit: int | None = None,
     deal_invoices_offset: int = Query(0, ge=0),
     deal_invoices_limit: int = Query(10, gt=0, le=100),
     offline_deals_offset: int = Query(0, ge=0),

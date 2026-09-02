@@ -295,8 +295,7 @@ async def get_wallet_balance(
     company = result.scalar_one_or_none()
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
-    if company.company_type != CompanyType.BRAND:
-        raise HTTPException(status_code=403, detail="Wallet is only available for Brand companies")
+
     return WalletBalanceOut(
         company_id=company.id,
         wallet_balance=company.wallet_balance,

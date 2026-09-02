@@ -1,11 +1,12 @@
 import json
+import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Company, Payment, PaymentStatus, PromoCode, WalletRecharge, WalletRechargeStatus, MaterialPurchase, PurchaseStatus
+from app.models import Company, Payment, PaymentStatus, PromoCode, WalletRecharge, WalletRechargeStatus, MaterialPurchase, PurchaseStatus, MaterialListing
 from app.services import razorpay_client
 
 router = APIRouter(prefix="/webhooks/razorpay", tags=["razorpay-webhooks"])
@@ -95,11 +96,50 @@ async def _handle_order_paid(db: AsyncSession, event: dict) -> None:
             # Return 200 so Razorpay stops retrying — there is nothing to do.
             return
 
-        if purchase.purchase_status in (PurchaseStatus.CONFIRMED, PurchaseStatus.CANCELLED):
+        if purchase.purchase_status == PurchaseStatus.CONFIRMED:
+            return
+
+        if purchase.purchase_status == PurchaseStatus.CANCELLED:
+            # The brand cancelled the order before the payment completed, but
+            # the payment succeeded anyway. Refund the money via Razorpay.
+            if purchase.razorpay_payment_id:
+                return
+            try:
+                await razorpay_client.refund_payment(
+                    payment_id=payment_entity["id"],
+                    amount_in_rupees=float(purchase.total_price),
+                    receipt=f"rfnd_cxl_{str(purchase.id)[:20]}"
+                )
+                # Only mark as handled once the refund succeeds
+                purchase.razorpay_payment_id = payment_entity["id"]
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "refund" in error_msg:
+                    # The payment was already refunded (e.g., from a previous webhook 
+                    # attempt where the DB commit failed). Mark as handled.
+                    logging.warning(f"Refund already processed for {purchase.id}: {e}")
+                    purchase.razorpay_payment_id = payment_entity["id"]
+                    return
+
+                logging.error(f"Failed to refund cancelled purchase {purchase.id}: {e}")
+                # Raise 502 so the DB transaction aborts and Razorpay retries the webhook
+                raise HTTPException(status_code=502, detail="Failed to refund payment via Razorpay")
             return
 
         purchase.razorpay_payment_id = payment_entity["id"]
         purchase.purchase_status = PurchaseStatus.CONFIRMED
+
+        # Credit the recycler's wallet now that payment is secured
+        listing = await db.execute(select(MaterialListing).where(MaterialListing.id == purchase.listing_id))
+        listing = listing.scalar_one_or_none()
+        if listing and listing.recycler_id:
+            recycler_company = await db.execute(
+                select(Company).where(Company.id == listing.recycler_id).with_for_update()
+            )
+            recycler_company = recycler_company.scalar_one_or_none()
+            if recycler_company:
+                recycler_company.wallet_balance += purchase.total_price
+                recycler_company.frozen_wallet_balance += purchase.total_price
 
     else:
         # ── Subscription / plan payment order ────────────────────────────

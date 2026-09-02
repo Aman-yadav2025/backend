@@ -57,6 +57,7 @@ from app.schemas import (
     MaterialPurchaseCreate,
     MaterialPurchaseOut,
     OfflineDealCreate,
+    RecyclerProfileOut,
 )
 from app.security import require_company_admin, require_active_company_membership
 
@@ -161,6 +162,9 @@ async def browse_listings(
     company_id: uuid.UUID,
     material_type: str | None = None,
     category: str | None = None,
+    recycler_id: uuid.UUID | None = None,
+    limit: int | None = None,
+    offset: int = 0,
     deps: tuple[Company, CompanyMember] = Depends(_require_brand),
     db: AsyncSession = Depends(get_db),
 ):
@@ -168,19 +172,65 @@ async def browse_listings(
     Returns all active recycler listings visible to Brands.
     Optional query params: `material_type`, `category` for basic filtering.
     """
-    q = select(MaterialListing).where(
+    q = select(
+        MaterialListing,
+        Company.name.label("recycler_name"),
+        Company.city.label("recycler_city"),
+        Company.state.label("recycler_state")
+    ).outerjoin(Company, MaterialListing.recycler_id == Company.id).where(
         MaterialListing.is_active.is_(True),
-        MaterialListing.created_by_brand_id.is_(None)
+        MaterialListing.created_by_brand_id.is_(None),
+        Company.deleted_at.is_(None)
     )
 
     if material_type is not None:
         q = q.where(MaterialListing.material_type == material_type)
     if category is not None:
         q = q.where(MaterialListing.category.ilike(f"%{category}%"))
+    if recycler_id is not None:
+        q = q.where(MaterialListing.recycler_id == recycler_id)
 
     q = q.order_by(MaterialListing.created_at.desc())
+    if limit is not None:
+        q = q.limit(limit)
+    if offset > 0:
+        q = q.offset(offset)
+        
     result = await db.execute(q)
-    return result.scalars().all()
+    rows = result.all()
+    
+    out_list = []
+    for row in rows:
+        listing = row.MaterialListing
+        out = MaterialListingOut.model_validate(listing)
+        out.recycler_name = row.recycler_name
+        out.recycler_city = row.recycler_city
+        out.recycler_state = row.recycler_state
+        out_list.append(out)
+        
+    return out_list
+
+
+@router.get("/recyclers/{recycler_id}", response_model=RecyclerProfileOut)
+async def get_recycler_profile(
+    company_id: uuid.UUID,
+    recycler_id: uuid.UUID,
+    deps: tuple[Company, CompanyMember] = Depends(_require_brand),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns the public profile data of a Recycler partner."""
+    q = select(Company).where(
+        Company.id == recycler_id,
+        Company.company_type == CompanyType.RECYCLER,
+        Company.deleted_at.is_(None)
+    )
+    result = await db.execute(q)
+    recycler = result.scalar_one_or_none()
+    
+    if recycler is None:
+        raise HTTPException(status_code=404, detail="Recycler not found or unavailable")
+        
+    return RecyclerProfileOut.model_validate(recycler)
 
 
 @router.get("/{listing_id}", response_model=MaterialListingOut)
@@ -191,16 +241,29 @@ async def get_listing_detail(
     db: AsyncSession = Depends(get_db),
 ):
     """Returns a single active listing detail."""
-    listing = await db.scalar(
-        select(MaterialListing).where(
-            MaterialListing.id == listing_id,
-            MaterialListing.is_active.is_(True),
-            MaterialListing.created_by_brand_id.is_(None)
-        )
+    q = select(
+        MaterialListing,
+        Company.name.label("recycler_name"),
+        Company.city.label("recycler_city"),
+        Company.state.label("recycler_state")
+    ).outerjoin(Company, MaterialListing.recycler_id == Company.id).where(
+        MaterialListing.id == listing_id,
+        MaterialListing.is_active.is_(True),
+        MaterialListing.created_by_brand_id.is_(None),
+        Company.deleted_at.is_(None)
     )
-    if listing is None:
+    result = await db.execute(q)
+    row = result.first()
+    
+    if row is None:
         raise HTTPException(status_code=404, detail="Listing not found or no longer active")
-    return listing
+        
+    out = MaterialListingOut.model_validate(row.MaterialListing)
+    out.recycler_name = row.recycler_name
+    out.recycler_city = row.recycler_city
+    out.recycler_state = row.recycler_state
+    
+    return out
 
 
 # ─── Purchase ─────────────────────────────────────────────────────────────────
@@ -242,14 +305,17 @@ async def purchase_listing(
     # an active listing. We re-validate quantity against available_quantity
     # inside the locked section below.
     listing_preview = await db.scalar(
-        select(MaterialListing).where(
+        select(MaterialListing)
+        .join(Company, MaterialListing.recycler_id == Company.id)
+        .where(
             MaterialListing.id == listing_id,
             MaterialListing.is_active.is_(True),
             MaterialListing.created_by_brand_id.is_(None),
+            Company.deleted_at.is_(None)
         )
     )
     if listing_preview is None:
-        raise HTTPException(status_code=404, detail="Listing not found or no longer active")
+        raise HTTPException(status_code=404, detail="Listing not found, inactive, or recycler deleted")
 
     total_price: Decimal = (listing_preview.price_per_unit * body.quantity).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP
@@ -290,15 +356,18 @@ async def purchase_listing(
     # To eliminate it entirely, call razorpay_client.close_order(razorpay_order_id)
     # in the HTTPException branches below.
     listing = await db.scalar(
-        select(MaterialListing).where(
+        select(MaterialListing)
+        .join(Company, MaterialListing.recycler_id == Company.id)
+        .where(
             MaterialListing.id == listing_id,
             MaterialListing.is_active.is_(True),
             MaterialListing.created_by_brand_id.is_(None),
+            Company.deleted_at.is_(None)
         )
-        .with_for_update()
+        .with_for_update(of=MaterialListing)
     )
     if listing is None:
-        raise HTTPException(status_code=404, detail="Listing not found or no longer active")
+        raise HTTPException(status_code=404, detail="Listing not found, inactive, or recycler deleted")
 
     if body.quantity > listing.available_quantity:
         raise HTTPException(
@@ -308,6 +377,17 @@ async def purchase_listing(
                 f"({listing.available_quantity})."
             ),
         )
+
+    if listing.min_order_quantity is not None:
+        effective_moq = min(listing.min_order_quantity, listing.available_quantity)
+        if body.quantity < effective_moq:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Requested quantity {body.quantity} is less than the effective Minimum Order Quantity "
+                    f"({effective_moq})."
+                ),
+            )
 
     # Re-compute total_price from the now-locked listing to guard against a
     # price change between the unlocked preview read and this lock. If the
@@ -357,8 +437,10 @@ async def purchase_listing(
         company.wallet_balance -= immediate_deduction
         company.frozen_wallet_balance += pending_deduction
 
-    # ── 5. Lock and update recycler wallet (BOTH payment methods) ─────────
-    if listing.recycler_id:
+    # ── 5. Lock and update recycler wallet (WALLET payment only) ──────────
+    # For DIRECT purchases, we do not credit the recycler until the Razorpay
+    # webhook confirms the payment.
+    if body.payment_method == PaymentMethod.WALLET and listing.recycler_id:
         recycler_company = await db.scalar(
             select(Company).where(Company.id == listing.recycler_id).with_for_update()
         )
@@ -399,15 +481,23 @@ async def purchase_listing(
 @router.get("/purchases", response_model=list[MaterialPurchaseOut])
 async def list_purchases(
     company_id: uuid.UUID,
+    limit: int | None = None,
+    offset: int = 0,
     deps: tuple[Company, CompanyMember] = Depends(_require_brand),
     db: AsyncSession = Depends(get_db),
 ):
     """Returns all purchases made by this brand, newest first."""
-    result = await db.execute(
+    query = (
         select(MaterialPurchase)
         .where(MaterialPurchase.brand_id == company_id)
         .order_by(MaterialPurchase.created_at.desc())
     )
+    if limit is not None:
+        query = query.limit(limit)
+    if offset > 0:
+        query = query.offset(offset)
+        
+    result = await db.execute(query)
     purchases = result.scalars().all()
 
     # immediate_deduction is not stored — reconstruct it from total_price and pending.
@@ -517,12 +607,14 @@ async def confirm_delivery(
     pending: Decimal = purchase.pending_wallet_deduction
     immediate_deduction: Decimal = purchase.total_price - pending
 
-    # ── 2. Lock and update the company wallet (WALLET only) ──────────────
-    if purchase.payment_method == PaymentMethod.WALLET:
-        await db.refresh(company, with_for_update=True)
-        if company.deleted_at is not None:
-            raise HTTPException(status_code=404, detail="Company not found")
+    # ── 2. Lock the company wallet (Brand) ───────────────────────────────
+    # ALWAYS lock the Brand first to maintain a consistent lock hierarchy 
+    # (Brand -> Recycler) and prevent deadlocks with create_purchase.
+    await db.refresh(company, with_for_update=True)
+    if company.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Company not found")
 
+    if purchase.payment_method == PaymentMethod.WALLET:
         # Safety guard: wallet_balance should always cover the pending amount
         # because it was frozen at purchase time — but an admin could have
         # manually corrected the balance downward.
@@ -554,19 +646,7 @@ async def confirm_delivery(
     purchase.pending_wallet_deduction = Decimal("0.00")
 
     # ── 4. Award EPR credits (1 Metric Ton purchased = 1 EPR credit) ─────
-    # For WALLET purchases the company row was already locked with FOR UPDATE
-    # in step 2. For DIRECT purchases the company row has not been touched in
-    # this transaction yet, so we must issue a fresh SELECT FOR UPDATE to
-    # prevent concurrent deliveries from double-awarding credits.
-    if purchase.payment_method != PaymentMethod.WALLET:
-        company = await db.scalar(
-            select(Company).where(
-                Company.id == company_id,
-                Company.deleted_at.is_(None),
-            ).with_for_update()
-        )
-        if company is None:
-            raise HTTPException(status_code=404, detail="Company not found")
+    # The Brand company row is already locked in step 2.
     epr_earned = purchase.purchased_quantity
     company.epr_credits_purchased += epr_earned
     company.epr_credits_available += epr_earned
@@ -638,8 +718,8 @@ async def cancel_purchase(
         company.wallet_balance += immediate_deduction           # refund first half
         company.frozen_wallet_balance -= pending                # unfreeze second half
 
-    # ── 3.5. Lock and update recycler wallet (BOTH payment methods) ───────
-    if listing is not None and listing.recycler_id:
+    # ── 3.5. Lock and update recycler wallet (WALLET purchases only) ───────
+    if purchase.purchase_status == PurchaseStatus.PENDING and listing is not None and listing.recycler_id:
         recycler_company = await db.scalar(
             select(Company).where(Company.id == listing.recycler_id).with_for_update()
         )
