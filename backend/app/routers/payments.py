@@ -236,7 +236,7 @@ async def request_refund(
                 CompanyMember.id == admin_member.id,
                 CompanyMember.status == MemberStatus.ACTIVE,
                 CompanyMember.member_role == MemberRole.OWNER
-            )
+            ).with_for_update()
         )
         if not recheck.scalar_one_or_none():
             raise HTTPException(status_code=403, detail="Admin privileges revoked during request")

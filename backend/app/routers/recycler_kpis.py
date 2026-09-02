@@ -1,7 +1,6 @@
 import uuid
 from decimal import Decimal
 from datetime import datetime
-import asyncio
 from typing import Optional
 from collections import defaultdict
 
@@ -50,9 +49,6 @@ from app.schemas import (
 )
 from app.security import require_company_admin
 from pydantic import BaseModel
-
-class AttachDocumentRequest(BaseModel):
-    document_id: uuid.UUID
 
 router = APIRouter(prefix="/companies/{company_id}/kpis", tags=["kpis"])
 
@@ -122,10 +118,11 @@ async def get_recycler_dashboard_kpis(
     # 3. Deal Status Summary (Lifetime)
     status_query = (
         select(
-            func.sum(case((MaterialPurchase.purchase_status == PurchaseStatus.PENDING, 1), else_=0)).label("pending"),
+            func.sum(case((MaterialPurchase.purchase_status.in_([PurchaseStatus.PENDING, PurchaseStatus.AWAITING_PAYMENT]), 1), else_=0)).label("pending"),
             func.sum(case(((MaterialPurchase.purchase_status == PurchaseStatus.CONFIRMED) & (MaterialPurchase.arrival_status == ArrivalStatus.PENDING), 1), else_=0)).label("processing"),
+            func.sum(case(((MaterialPurchase.purchase_status == PurchaseStatus.CONFIRMED) & (MaterialPurchase.arrival_status == ArrivalStatus.READY_TO_SHIP), 1), else_=0)).label("ready_to_ship"),
             func.sum(case(((MaterialPurchase.purchase_status == PurchaseStatus.CONFIRMED) & (MaterialPurchase.arrival_status == ArrivalStatus.IN_TRANSIT), 1), else_=0)).label("in_transit"),
-            func.sum(case(((MaterialPurchase.purchase_status == PurchaseStatus.CONFIRMED) & (MaterialPurchase.arrival_status == ArrivalStatus.DELIVERED), 1), else_=0)).label("delivered"),
+            func.sum(case((MaterialPurchase.arrival_status == ArrivalStatus.DELIVERED, 1), else_=0)).label("delivered"),
             func.sum(case((MaterialPurchase.purchase_status == PurchaseStatus.CANCELLED, 1), else_=0)).label("cancelled")
         )
         .join(MaterialListing, MaterialPurchase.listing_id == MaterialListing.id)
@@ -137,6 +134,7 @@ async def get_recycler_dashboard_kpis(
     deal_status_summary = RecyclerDealStatusSummary(
         pending=status_row.pending or 0,
         processing=status_row.processing or 0,
+        ready_to_ship=status_row.ready_to_ship or 0,
         in_transit=status_row.in_transit or 0,
         delivered=status_row.delivered or 0,
         cancelled=status_row.cancelled or 0
@@ -175,9 +173,13 @@ async def get_recycler_dashboard_kpis(
             status_str = "Cancelled"
         elif p.purchase_status == PurchaseStatus.PENDING:
             status_str = "Pending"
+        elif p.purchase_status == PurchaseStatus.AWAITING_PAYMENT:
+            status_str = "Awaiting Payment"
         else:
             if p.arrival_status == ArrivalStatus.PENDING:
                 status_str = "Processing"
+            elif p.arrival_status == ArrivalStatus.READY_TO_SHIP:
+                status_str = "Ready to Ship"
             elif p.arrival_status == ArrivalStatus.IN_TRANSIT:
                 status_str = "In Transit"
             else:
@@ -326,46 +328,6 @@ async def get_collector_spend_summary(
     return CollectorSpendSummaryResponse(monthly_summaries=monthly_summaries)
 
 
-@router.patch("/collector-purchases/{purchase_id}/document", response_model=CollectorPurchaseOut)
-async def attach_document_to_collector_purchase(
-    company_id: uuid.UUID,
-    purchase_id: uuid.UUID,
-    body: AttachDocumentRequest,
-    admin_member: CompanyMember = Depends(require_company_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Attaches an uploaded document to a specific collector purchase.
-    """
-    # 1. Verify purchase belongs to company
-    purchase = (await db.execute(
-        select(CollectorPurchase).where(
-            CollectorPurchase.id == purchase_id,
-            CollectorPurchase.recycler_id == company_id
-        ).with_for_update()
-    )).scalar_one_or_none()
-    
-    if not purchase:
-        raise HTTPException(status_code=404, detail="Collector purchase not found")
-        
-    # 2. Verify document belongs to company
-    doc = (await db.execute(
-        select(Document).where(
-            Document.id == body.document_id,
-            Document.company_id == company_id
-        )
-    )).scalar_one_or_none()
-    
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found or access denied")
-        
-    purchase.document_id = doc.id
-    await db.commit()
-    await db.refresh(purchase)
-    
-    return purchase
-
-
 @router.get("/invoice-stats", response_model=InvoiceStatsKPI)
 async def get_recycler_invoice_stats(
     company_id: uuid.UUID,
@@ -415,10 +377,16 @@ async def get_recycler_wallet_review(
     """
     Returns wallet metrics (received vs pending) and paginated invoice lists for Brand deals.
     """
-    # 1. Get totals
+    # 1. Get authoritative pending wallet total directly from the company row
+    recycler = await db.get(Company, company_id)
+    if not recycler:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    total_pending = recycler.frozen_wallet_balance
+
+    # 2. Get lifetime total paid and invoice count
     totals_query = select(
-        func.sum(MaterialPurchase.total_price).filter(MaterialPurchase.purchase_status == PurchaseStatus.CONFIRMED).label("paid"),
-        func.sum(MaterialPurchase.total_price).filter(MaterialPurchase.purchase_status == PurchaseStatus.PENDING).label("pending"),
+        func.sum(MaterialPurchase.total_price).filter(MaterialPurchase.arrival_status == ArrivalStatus.DELIVERED).label("paid"),
         func.count(MaterialPurchase.id).label("total_count")
     ).select_from(
         MaterialPurchase
@@ -427,11 +395,9 @@ async def get_recycler_wallet_review(
     ).where(
         MaterialListing.recycler_id == company_id
     )
-
-    totals_res = (await db.execute(totals_query)).one()
     
+    totals_res = (await db.execute(totals_query)).one()
     total_paid = totals_res.paid or Decimal("0.00")
-    total_pending = totals_res.pending or Decimal("0.00")
     total_count = totals_res.total_count or 0
 
     # 2. Get paginated invoices
@@ -450,9 +416,13 @@ async def get_recycler_wallet_review(
             status_str = "Cancelled"
         elif p.purchase_status == PurchaseStatus.PENDING:
             status_str = "Pending"
+        elif p.purchase_status == PurchaseStatus.AWAITING_PAYMENT:
+            status_str = "Awaiting Payment"
         else:
             if p.arrival_status == ArrivalStatus.PENDING:
                 status_str = "Processing"
+            elif p.arrival_status == ArrivalStatus.READY_TO_SHIP:
+                status_str = "Ready to Ship"
             elif p.arrival_status == ArrivalStatus.IN_TRANSIT:
                 status_str = "In Transit"
             else:
@@ -500,14 +470,14 @@ async def get_recycler_invoice_ledger(
         ).label("rate"),
         MaterialPurchase.total_price.label("total"),
         literal("SALE", type_=Text).label("deal_type"),
-        literal(None, type_=Text).label("document_id")
+        func.coalesce(MaterialListing.invoice_document_id.cast(Text), literal("", type_=Text)).label("document_id")
     ).select_from(MaterialPurchase).join(
         MaterialListing, MaterialPurchase.listing_id == MaterialListing.id
     ).join(
         Company, MaterialPurchase.brand_id == Company.id
     ).where(
         MaterialListing.recycler_id == company_id,
-        MaterialPurchase.purchase_status == PurchaseStatus.CONFIRMED
+        MaterialPurchase.purchase_status.in_([PurchaseStatus.PENDING, PurchaseStatus.AWAITING_PAYMENT, PurchaseStatus.CONFIRMED])
     )
 
     # 2. Purchases from Collectors (CollectorPurchase)
@@ -547,7 +517,7 @@ async def get_recycler_invoice_ledger(
         short_id = deal_id_str[:8].upper()
         
         if row.deal_type == "SALE":
-            action_url = f"/companies/{company_id}/kpis/brand-deals/{deal_id_str}/invoice"
+            action_url = f"/companies/{company_id}/kpis/brand-deals/{deal_id_str}/invoice" if row.document_id else None
         else:
             action_url = f"/companies/{company_id}/documents/{row.document_id}/download" if row.document_id else None
             
@@ -645,12 +615,11 @@ async def get_recycler_financial_report(
         MaterialPurchase.purchase_status
     )
 
-    # Execute all concurrently
-    cp_res, ml_res, mp_res = await asyncio.gather(
-        db.execute(cp_query),
-        db.execute(ml_query),
-        db.execute(mp_query)
-    )
+    # NOTE: AsyncSession is NOT concurrency-safe — do NOT use asyncio.gather here.
+    # Concurrent db.execute() calls on the same session can corrupt the connection.
+    cp_res  = await db.execute(cp_query)
+    ml_res  = await db.execute(ml_query)
+    mp_res  = await db.execute(mp_query)
 
     months_data = defaultdict(lambda: {
         "material_purchased_from_collectors": [],
@@ -743,9 +712,14 @@ async def create_invoice_proof(
     """
     Upload a new proof bill tied to a specific collector purchase.
     """
-    # Verify the collector purchase exists and belongs to this recycler
-    purchase = await db.get(CollectorPurchase, payload.invoice_id)
-    if not purchase or purchase.recycler_id != company_id:
+    # Verify the collector purchase exists and belongs to this recycler (lock to prevent concurrent deletion)
+    purchase = (await db.execute(
+        select(CollectorPurchase).where(
+            CollectorPurchase.id == payload.invoice_id,
+            CollectorPurchase.recycler_id == company_id,
+        ).with_for_update()
+    )).scalar_one_or_none()
+    if not purchase:
         raise HTTPException(status_code=404, detail="Collector Purchase not found")
 
     # Prevent duplicate proof for the same (collector purchase, category) pair
@@ -760,8 +734,13 @@ async def create_invoice_proof(
         raise HTTPException(status_code=409, detail="An invoice proof for this category already exists for this collector purchase")
 
     if payload.document_id:
-        doc = await db.get(Document, payload.document_id)
-        if not doc or doc.company_id != company_id:
+        doc = (await db.execute(
+            select(Document).where(
+                Document.id == payload.document_id,
+                Document.company_id == company_id,
+            )
+        )).scalar_one_or_none()
+        if not doc:
             raise HTTPException(status_code=403, detail="Document not found or unauthorized")
         
     new_proof = InvoiceProof(

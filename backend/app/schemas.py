@@ -4,7 +4,7 @@ from decimal import Decimal
 
 from typing import Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.models import (
     CompanyType,
@@ -66,8 +66,10 @@ class CompanyOut(BaseModel):
     company_type: CompanyType
     pack: PackType
     tier: int
-    epr_credits_available: int
-    epr_credits_required: int
+    epr_credits_available:  Decimal
+    epr_credits_required:   Decimal
+    epr_credits_purchased:  Decimal
+    epr_credits_utilized:   Decimal
     wallet_balance: Decimal
     frozen_wallet_balance: Decimal
     created_at: datetime
@@ -156,11 +158,23 @@ class DocumentPresignRequest(BaseModel):
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         }
+        EXT_TO_MIME: dict[str, str] = {
+            ".pdf":  "application/pdf",
+            ".jpg":  "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png":  "image/png",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
         ext = ""
         if "." in self.file_name:
             ext = self.file_name[self.file_name.rindex("."):].lower()
         if ext not in ALLOWED_EXTENSIONS or self.file_type not in ALLOWED_MIME_TYPES:
             raise ValueError("File type not allowed. Allowed types are: PDF, JPG, PNG, DOCX, XLSX")
+        if EXT_TO_MIME.get(ext) != self.file_type:
+            raise ValueError(
+                f"file_type '{self.file_type}' does not match the extension '{ext}'"
+            )
         return self
 
 
@@ -187,11 +201,23 @@ class DocumentCreate(BaseModel):
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         }
+        EXT_TO_MIME: dict[str, str] = {
+            ".pdf":  "application/pdf",
+            ".jpg":  "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png":  "image/png",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
         ext = ""
         if "." in self.file_name:
             ext = self.file_name[self.file_name.rindex("."):].lower()
         if ext not in ALLOWED_EXTENSIONS or self.file_type not in ALLOWED_MIME_TYPES:
             raise ValueError("File type not allowed. Allowed types are: PDF, JPG, PNG, DOCX, XLSX")
+        if EXT_TO_MIME.get(ext) != self.file_type:
+            raise ValueError(
+                f"file_type '{self.file_type}' does not match the extension '{ext}'"
+            )
         return self
 
 
@@ -567,14 +593,44 @@ class TopRecyclerItem(BaseModel):
 
 class OrderStatusSummary(BaseModel):
     delivered: int
-    processed: int
+    shipped: int
+    ready_to_ship: int
+    processing: int
     pending: int
     canceled: int
 
 
 class EPRKPIs(BaseModel):
-    credits_available: int
-    credits_required: int
+    credits_available: Decimal
+    credits_required:  Decimal
+    credits_purchased: Decimal
+    credits_utilized:  Decimal
+
+
+class CompanyEPRSetUtilized(BaseModel):
+    """Admin-only: set epr_credits_utilized. available is auto-derived as purchased - utilized."""
+    epr_credits_utilized: Decimal
+
+    @field_validator("epr_credits_utilized")
+    @classmethod
+    def must_be_non_negative(cls, v: Decimal) -> Decimal:
+        if v < 0:
+            raise ValueError("epr_credits_utilized cannot be negative")
+        return v
+
+
+class CompanyEPROverride(BaseModel):
+    """Admin-only: directly override all three mutable EPR states."""
+    epr_credits_required:  Decimal
+    epr_credits_purchased: Decimal
+    epr_credits_utilized:  Decimal
+
+    @field_validator("epr_credits_required", "epr_credits_purchased", "epr_credits_utilized")
+    @classmethod
+    def must_be_non_negative(cls, v: Decimal) -> Decimal:
+        if v < 0:
+            raise ValueError("EPR credit values cannot be negative")
+        return v
 
 
 class WalletTransactionItem(BaseModel):
@@ -658,6 +714,7 @@ class RecyclerMonthlySalesTrendItem(BaseModel):
 class RecyclerDealStatusSummary(BaseModel):
     pending: int
     processing: int
+    ready_to_ship: int
     in_transit: int
     delivered: int
     cancelled: int
@@ -729,6 +786,19 @@ class CollectorPurchaseCreate(BaseModel):
     material_type: str = Field(min_length=1, strip_whitespace=True)
     quantity: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
     price: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    document_id: uuid.UUID | None = None
+
+class CollectorPurchaseUpdate(BaseModel):
+    collector_name: str | None = Field(default=None, min_length=1, strip_whitespace=True)
+    collector_company_name: str | None = Field(default=None, min_length=1, strip_whitespace=True)
+    mobile_number: str | None = Field(default=None, min_length=10, max_length=15, strip_whitespace=True)
+    gst_number: str | None = None
+    address: str | None = Field(default=None, min_length=1, strip_whitespace=True)
+    category: MaterialType | None = None
+    material_type: str | None = Field(default=None, min_length=1, strip_whitespace=True)
+    quantity: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+    price: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+    document_id: uuid.UUID | None = None
 
 
 class CollectorPurchaseOut(BaseModel):

@@ -3,8 +3,8 @@ from decimal import Decimal
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select, text, Integer
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import case, func, literal, select, text, Integer, String, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -17,6 +17,7 @@ from app.models import (
     MemberStatus,
     Payment,
     PaymentStatus,
+    PaymentMethod,
     RefundRequest,
     RefundRequestStatus,
     MaterialPurchase,
@@ -303,8 +304,10 @@ async def get_order_status_summary(
     query = (
         select(
             func.sum(func.cast(MaterialPurchase.arrival_status == ArrivalStatus.DELIVERED, Integer)).label("delivered"),
-            func.sum(func.cast((MaterialPurchase.purchase_status == PurchaseStatus.CONFIRMED) & (MaterialPurchase.arrival_status != ArrivalStatus.DELIVERED), Integer)).label("processed"),
-            func.sum(func.cast(MaterialPurchase.purchase_status == PurchaseStatus.PENDING, Integer)).label("pending"),
+            func.sum(func.cast(MaterialPurchase.arrival_status == ArrivalStatus.IN_TRANSIT, Integer)).label("shipped"),
+            func.sum(func.cast(MaterialPurchase.arrival_status == ArrivalStatus.READY_TO_SHIP, Integer)).label("ready_to_ship"),
+            func.sum(func.cast((MaterialPurchase.purchase_status == PurchaseStatus.CONFIRMED) & (MaterialPurchase.arrival_status == ArrivalStatus.PENDING), Integer)).label("processing"),
+            func.sum(func.cast(MaterialPurchase.purchase_status.in_([PurchaseStatus.PENDING, PurchaseStatus.AWAITING_PAYMENT]), Integer)).label("pending"),
             func.sum(func.cast(MaterialPurchase.purchase_status == PurchaseStatus.CANCELLED, Integer)).label("canceled"),
         )
         .where(MaterialPurchase.brand_id == company_id)
@@ -313,7 +316,9 @@ async def get_order_status_summary(
     row = result.one()
     return OrderStatusSummary(
         delivered=row.delivered or 0,
-        processed=row.processed or 0,
+        shipped=row.shipped or 0,
+        ready_to_ship=row.ready_to_ship or 0,
+        processing=row.processing or 0,
         pending=row.pending or 0,
         canceled=row.canceled or 0,
     )
@@ -342,7 +347,7 @@ async def get_recent_purchases(
         p = row.MaterialPurchase
         if p.purchase_status == PurchaseStatus.CANCELLED:
             status = "Canceled"
-        elif p.purchase_status == PurchaseStatus.CONFIRMED:
+        elif p.arrival_status == ArrivalStatus.DELIVERED:
             status = "Success"
         else:
             status = "Pending"
@@ -442,65 +447,73 @@ async def get_offline_deals(
 async def get_wallet_transactions(
     db: AsyncSession, company_id: uuid.UUID, offset: int = 0, limit: int = 50
 ) -> list[WalletTransactionItem]:
-    fetch_limit = offset + limit
-    # Fetch Recharges
-    recharge_query = (
-        select(WalletRecharge)
-        .where(WalletRecharge.company_id == company_id)
-        .order_by(WalletRecharge.created_at.desc())
-        .limit(fetch_limit)
-    )
-    recharge_result = await db.execute(recharge_query)
-    recharges = recharge_result.scalars().all()
+    """
+    Combines WalletRecharge (credits) and MaterialPurchase (debits) into a
+    single chronological ledger, paginated correctly via a SQL UNION ALL.
 
-    # Fetch Purchases (deductions)
-    purchase_query = (
-        select(MaterialPurchase)
-        .where(MaterialPurchase.brand_id == company_id)
-        .order_by(MaterialPurchase.created_at.desc())
-        .limit(fetch_limit)
-    )
-    purchase_result = await db.execute(purchase_query)
-    purchases = purchase_result.scalars().all()
+    NOTE: Python-side merge-sort pagination (fetch N from each table, merge,
+    then slice) is fundamentally broken when one table has many more rows than
+    the other — records from the larger table get truncated before the merge,
+    so the slice falls into the wrong table. A SQL UNION ALL is the correct fix.
+    """
 
-    transactions = []
-    
-    # Map recharges
-    for r in recharges:
-        status_val = r.status.value if hasattr(r.status, "value") else str(r.status)
-        transactions.append({
-            "transaction_id": str(r.id)[:8].upper(), # simple visual ID
-            "date": r.created_at,
-            "amount": r.amount,
-            "is_credit": True,
-            "payment_method": "Online",
-            "type": "Wallet Recharge",
-            "status": status_val.capitalize()
-        })
-        
-    # Map purchases
-    for p in purchases:
-        # In UI, status is Success or Pending. 
-        # For purchase, CONFIRMED/DELIVERED means Success, PENDING means Pending.
-        status_val = p.purchase_status.value if hasattr(p.purchase_status, "value") else str(p.purchase_status)
-        status = "Success" if p.purchase_status == PurchaseStatus.CONFIRMED else status_val.capitalize()
-        transactions.append({
-            "transaction_id": str(p.listing_id)[:8].upper(),
-            "date": p.created_at,
-            "amount": p.total_price,
-            "is_credit": False,
-            "payment_method": "Wallet",
-            "type": "Purchase Payment",
-            "status": status
-        })
-        
-    # Sort by date descending
-    transactions.sort(key=lambda x: x["date"], reverse=True)
-    
-    # Slice using offset and limit
-    transactions = transactions[offset : offset + limit]
-    
-    return [WalletTransactionItem(**t) for t in transactions]
+    # ── Recharges (credits) ───────────────────────────────────────────────────
+    recharge_q = select(
+        WalletRecharge.id.cast(String).label("transaction_id_raw"),
+        WalletRecharge.created_at.label("date"),
+        WalletRecharge.amount.label("amount"),
+        literal(True).label("is_credit"),
+        literal("Online").label("payment_method"),
+        literal("Wallet Recharge").label("type"),
+        case(
+            (WalletRecharge.status == WalletRechargeStatus.SUCCESS.value, "Success"),
+            (WalletRecharge.status == WalletRechargeStatus.PENDING.value, "Pending"),
+            (WalletRecharge.status == WalletRechargeStatus.FAILED.value, "Failed"),
+            else_="Unknown",
+        ).label("status"),
+    ).where(WalletRecharge.company_id == company_id)
+
+    # ── Purchases (debits) ────────────────────────────────────────────────────
+    purchase_q = select(
+        MaterialPurchase.id.cast(String).label("transaction_id_raw"),
+        MaterialPurchase.created_at.label("date"),
+        MaterialPurchase.total_price.label("amount"),
+        literal(False).label("is_credit"),
+        literal("Wallet").label("payment_method"),
+        literal("Purchase Payment").label("type"),
+        case(
+            (MaterialPurchase.arrival_status == ArrivalStatus.DELIVERED, "Success"),
+            (MaterialPurchase.purchase_status == PurchaseStatus.CANCELLED, "Cancelled"),
+            else_="Pending",
+        ).label("status"),
+    ).where(
+        MaterialPurchase.brand_id == company_id,
+        MaterialPurchase.payment_method == PaymentMethod.WALLET
+    )
+
+    # ── UNION ALL → single sorted, paginated query ────────────────────────────
+    union_subq = union_all(recharge_q, purchase_q).subquery()
+    data_query = (
+        select(union_subq)
+        .order_by(union_subq.c.date.desc(), union_subq.c.transaction_id_raw.asc())
+        .offset(offset)
+        .limit(limit)
+    )
+    result = await db.execute(data_query)
+
+    return [
+        WalletTransactionItem(
+            transaction_id=str(row.transaction_id_raw)[:8].upper(),
+            date=row.date,
+            amount=row.amount,
+            is_credit=bool(row.is_credit),
+            payment_method=row.payment_method,
+            type=row.type,
+            status=row.status,
+        )
+        for row in result.all()
+    ]
+
 
 
 @router.get("/brand-dashboard", response_model=BrandDashboardKPIs)
@@ -508,16 +521,16 @@ async def get_brand_dashboard_kpis(
     company_id: uuid.UUID,
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
-    purchase_history_offset: int = 0,
-    purchase_history_limit: int = 10,
-    wallet_history_offset: int = 0,
-    wallet_history_limit: int = 10,
-    top_recyclers_offset: int = 0,
-    top_recyclers_limit: int = 5,
-    deal_invoices_offset: int = 0,
-    deal_invoices_limit: int = 10,
-    offline_deals_offset: int = 0,
-    offline_deals_limit: int = 10,
+    purchase_history_offset: int = Query(0, ge=0),
+    purchase_history_limit: int = Query(10, gt=0, le=100),
+    wallet_history_offset: int = Query(0, ge=0),
+    wallet_history_limit: int = Query(10, gt=0, le=100),
+    top_recyclers_offset: int = Query(0, ge=0),
+    top_recyclers_limit: int = Query(5, gt=0, le=50),
+    deal_invoices_offset: int = Query(0, ge=0),
+    deal_invoices_limit: int = Query(10, gt=0, le=100),
+    offline_deals_offset: int = Query(0, ge=0),
+    offline_deals_limit: int = Query(10, gt=0, le=100),
     admin_member: CompanyMember = Depends(require_company_admin),
     db: AsyncSession = Depends(get_db),
 ):
@@ -538,6 +551,8 @@ async def get_brand_dashboard_kpis(
     epr_kpis = EPRKPIs(
         credits_available=company.epr_credits_available,
         credits_required=company.epr_credits_required,
+        credits_purchased=company.epr_credits_purchased,
+        credits_utilized=company.epr_credits_utilized,
     )
     unique_recyclers = await get_unique_recyclers_count(db, company_id)
     monthly_trend = await get_monthly_trend(db, company_id, start_date, end_date)

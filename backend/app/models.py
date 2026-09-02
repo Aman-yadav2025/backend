@@ -51,6 +51,12 @@ class MemberStatus(str, enum.Enum):
 class DocumentCategory(str, enum.Enum):
     COMPLIANCE = "COMPLIANCE"
     TAX = "TAX"
+    GST_CERTIFICATE = "GST_CERTIFICATE"
+    PAN_CARD = "PAN_CARD"
+    FACTORY_LICENSE = "FACTORY_LICENSE"
+    CERTIFICATE_OF_INCORPORATION = "CERTIFICATE_OF_INCORPORATION"
+    EPR_CERTIFICATE = "EPR_CERTIFICATE"
+    CANCELLED_CHEQUE = "CANCELLED_CHEQUE"
     RECYCLING_MANIFEST = "RECYCLING_MANIFEST"
     COLLECTOR_RECEIPT = "COLLECTOR_RECEIPT"
     OTHER = "OTHER"
@@ -103,6 +109,7 @@ class PurchaseStatus(str, enum.Enum):
 
 class ArrivalStatus(str, enum.Enum):
     PENDING = "PENDING"
+    READY_TO_SHIP = "READY_TO_SHIP"
     IN_TRANSIT = "IN_TRANSIT"
     DELIVERED = "DELIVERED"
 
@@ -181,8 +188,10 @@ class Company(Base):
     company_type: Mapped[CompanyType] = mapped_column(_pg_enum(CompanyType, "company_type"), nullable=False)
     pack: Mapped[PackType] = mapped_column(_pg_enum(PackType, "pack_type"), nullable=False)
     tier: Mapped[int] = mapped_column(Integer, nullable=False)
-    epr_credits_available: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    epr_credits_required: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    epr_credits_available:  Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0"), nullable=False)
+    epr_credits_required:   Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0"), nullable=False)
+    epr_credits_purchased:  Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0"), nullable=False)
+    epr_credits_utilized:   Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0"), nullable=False)
     wallet_balance: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0.00, nullable=False)
     # Sum of pending second-half amounts across all PENDING marketplace purchases.
     # True spendable balance = wallet_balance - frozen_wallet_balance.
@@ -197,7 +206,10 @@ class Company(Base):
         CheckConstraint("tier between 1 and 4", name="chk_company_tier_range"),
         CheckConstraint("wallet_balance >= 0", name="chk_company_wallet_balance_positive"),
         CheckConstraint("frozen_wallet_balance >= 0", name="chk_company_frozen_wallet_balance_positive"),
-        CheckConstraint("epr_credits_required >= 0", name="chk_company_epr_credits_required_positive"),
+        CheckConstraint("epr_credits_required >= 0",   name="chk_company_epr_credits_required_positive"),
+        CheckConstraint("epr_credits_available >= 0",  name="chk_company_epr_credits_available_positive"),
+        CheckConstraint("epr_credits_purchased >= 0",  name="chk_company_epr_credits_purchased_positive"),
+        CheckConstraint("epr_credits_utilized >= 0",   name="chk_company_epr_credits_utilized_positive"),
         Index("ix_companies_owner_id_unique", "owner_id", unique=True, postgresql_where=text("deleted_at IS NULL")),
     )
 
@@ -469,6 +481,10 @@ class CollectorPurchase(Base):
     )
     recycler_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("companies.id", ondelete="RESTRICT"), nullable=False
+    )
+    # NULL for legacy rows created before migration 021 — treated as owner-only editable.
+    created_by_profile_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("profiles.id", ondelete="RESTRICT"), nullable=True
     )
     collector_name: Mapped[str] = mapped_column(Text, nullable=False)
     collector_company_name: Mapped[str] = mapped_column(Text, nullable=False)

@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import Company, CompanyMember, MemberRole, MemberStatus, Profile, SystemRole, Payment, Document, PaymentStatus, PackType, CompanyType, WalletRecharge, WalletRechargeStatus
-from app.schemas import CompanyOut, CompanyEmployeeOut, CompanyPlanUpdate, CompanyUpdate, WalletRechargeCheckoutRequest, WalletRechargeCheckoutResponse, WalletRechargeVerifyRequest, WalletRechargeOut, WalletBalanceOut
+from app.schemas import CompanyOut, CompanyEmployeeOut, CompanyPlanUpdate, CompanyUpdate, WalletRechargeCheckoutRequest, WalletRechargeCheckoutResponse, WalletRechargeVerifyRequest, WalletRechargeOut, WalletBalanceOut, CompanyEPRSetUtilized, CompanyEPROverride
 from app.security import get_current_profile, require_company_admin, require_platform_admin, require_active_company_membership
 from app.services import razorpay_client
 from app.services.deletion import process_company_deletion_queue
@@ -416,3 +416,82 @@ async def wallet_recharge_verify(
         await db.refresh(recharge)
 
     return recharge
+
+
+# ─── EPR Credits ─────────────────────────────────────────────────────────────
+
+@router.patch("/{company_id}/epr/utilized", response_model=CompanyOut)
+async def set_epr_credits_utilized(
+    company_id: uuid.UUID,
+    payload: CompanyEPRSetUtilized,
+    _membership: CompanyMember = Depends(require_company_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Admin-only. Sets epr_credits_utilized for the company.
+    epr_credits_available is automatically recalculated as purchased - utilized.
+    """
+    company = await db.scalar(
+        select(Company).where(
+            Company.id == company_id,
+            Company.deleted_at.is_(None),
+        ).with_for_update()
+    )
+    if company is None:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    if payload.epr_credits_utilized > company.epr_credits_purchased:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"epr_credits_utilized ({payload.epr_credits_utilized}) cannot exceed "
+                f"epr_credits_purchased ({company.epr_credits_purchased})"
+            ),
+        )
+
+    company.epr_credits_utilized  = payload.epr_credits_utilized
+    company.epr_credits_available = company.epr_credits_purchased - payload.epr_credits_utilized
+
+    await db.commit()
+    await db.refresh(company)
+    return company
+
+
+@router.patch("/{company_id}/epr", response_model=CompanyOut)
+async def override_epr_credits(
+    company_id: uuid.UUID,
+    payload: CompanyEPROverride,
+    _membership: CompanyMember = Depends(require_company_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Admin-only. Directly overrides all three mutable EPR credit states:
+    epr_credits_required, epr_credits_purchased, and epr_credits_utilized.
+    epr_credits_available is automatically derived as purchased - utilized.
+    """
+    company = await db.scalar(
+        select(Company).where(
+            Company.id == company_id,
+            Company.deleted_at.is_(None),
+        ).with_for_update()
+    )
+    if company is None:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    if payload.epr_credits_utilized > payload.epr_credits_purchased:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"epr_credits_utilized ({payload.epr_credits_utilized}) cannot exceed "
+                f"epr_credits_purchased ({payload.epr_credits_purchased})"
+            ),
+        )
+
+    company.epr_credits_required  = payload.epr_credits_required
+    company.epr_credits_purchased  = payload.epr_credits_purchased
+    company.epr_credits_utilized   = payload.epr_credits_utilized
+    company.epr_credits_available  = payload.epr_credits_purchased - payload.epr_credits_utilized
+
+    await db.commit()
+    await db.refresh(company)
+    return company

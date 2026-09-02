@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request
+import logging
 import traceback
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -8,7 +9,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.config import settings
 from app.rate_limit import limiter
-from app.routers import admin, clerk_webhooks, companies, company_members, documents, kpis, marketplace, payments, promo_codes, razorpay_webhooks, profiles, brand_marketplace, recycler_kpis
+from app.routers import admin, clerk_webhooks, companies, company_members, documents, kpis, marketplace, payments, promo_codes, razorpay_webhooks, profiles, brand_marketplace, recycler_kpis, collector_purchases
 app = FastAPI(title="Platform API", version="1.0.0")
 
 # ── Rate limiter state ────────────────────────────────────────────────────────
@@ -17,11 +18,11 @@ app.state.limiter = limiter
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    print(f"Global exception: {exc}")
-    trace = traceback.format_exc()
+    # Log the full traceback server-side — never send it to the client.
+    logging.exception("Unhandled exception on %s %s", request.method, request.url)
     return JSONResponse(
         status_code=500,
-        content={"detail": str(exc), "traceback": trace}
+        content={"detail": "An internal server error occurred."},
     )
 
 @app.exception_handler(RateLimitExceeded)
@@ -75,6 +76,7 @@ app.include_router(profiles.router)
 app.include_router(marketplace.router)
 app.include_router(brand_marketplace.router)
 app.include_router(recycler_kpis.router)
+app.include_router(collector_purchases.router)
 
 @app.get("/health")
 async def health_check():

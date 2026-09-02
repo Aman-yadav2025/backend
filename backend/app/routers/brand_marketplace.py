@@ -357,7 +357,17 @@ async def purchase_listing(
         company.wallet_balance -= immediate_deduction
         company.frozen_wallet_balance += pending_deduction
 
-    # ── 5. Reserve inventory ──────────────────────────────────────────────
+    # ── 5. Lock and update recycler wallet (BOTH payment methods) ─────────
+    if listing.recycler_id:
+        recycler_company = await db.scalar(
+            select(Company).where(Company.id == listing.recycler_id).with_for_update()
+        )
+        if recycler_company:
+            # Credit the amount to wallet and freeze it simultaneously (pending escrow)
+            recycler_company.wallet_balance += locked_total_price
+            recycler_company.frozen_wallet_balance += locked_total_price
+
+    # ── 6. Reserve inventory ──────────────────────────────────────────────
     listing.available_quantity -= body.quantity
 
     # ── 6. Create the purchase record ─────────────────────────────────────
@@ -528,10 +538,38 @@ async def confirm_delivery(
         company.wallet_balance -= pending
         company.frozen_wallet_balance -= pending
 
+    # ── 2.5 Lock and update the recycler wallet (BOTH payment methods) ───
+    listing = await db.get(MaterialListing, purchase.listing_id)
+    if listing is not None and listing.recycler_id:
+        recycler_company = await db.scalar(
+            select(Company).where(Company.id == listing.recycler_id).with_for_update()
+        )
+        if recycler_company:
+            # Unfreeze the funds, making them available in the wallet balance
+            recycler_company.frozen_wallet_balance -= purchase.total_price
+
     # ── 3. Update purchase status ────────────────────────────────────────
     purchase.purchase_status = PurchaseStatus.CONFIRMED
     purchase.arrival_status = ArrivalStatus.DELIVERED
     purchase.pending_wallet_deduction = Decimal("0.00")
+
+    # ── 4. Award EPR credits (1 Metric Ton purchased = 1 EPR credit) ─────
+    # For WALLET purchases the company row was already locked with FOR UPDATE
+    # in step 2. For DIRECT purchases the company row has not been touched in
+    # this transaction yet, so we must issue a fresh SELECT FOR UPDATE to
+    # prevent concurrent deliveries from double-awarding credits.
+    if purchase.payment_method != PaymentMethod.WALLET:
+        company = await db.scalar(
+            select(Company).where(
+                Company.id == company_id,
+                Company.deleted_at.is_(None),
+            ).with_for_update()
+        )
+        if company is None:
+            raise HTTPException(status_code=404, detail="Company not found")
+    epr_earned = purchase.purchased_quantity
+    company.epr_credits_purchased += epr_earned
+    company.epr_credits_available += epr_earned
 
     await db.commit()
     await db.refresh(purchase)
@@ -599,6 +637,16 @@ async def cancel_purchase(
 
         company.wallet_balance += immediate_deduction           # refund first half
         company.frozen_wallet_balance -= pending                # unfreeze second half
+
+    # ── 3.5. Lock and update recycler wallet (BOTH payment methods) ───────
+    if listing is not None and listing.recycler_id:
+        recycler_company = await db.scalar(
+            select(Company).where(Company.id == listing.recycler_id).with_for_update()
+        )
+        if recycler_company:
+            # Revert the pending escrow
+            recycler_company.wallet_balance -= purchase.total_price
+            recycler_company.frozen_wallet_balance -= purchase.total_price
 
     # ── 4. Mark cancelled ────────────────────────────────────────────────
     purchase.purchase_status = PurchaseStatus.CANCELLED

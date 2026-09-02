@@ -29,8 +29,9 @@ async def handle_clerk_webhook(request: Request, db: AsyncSession = Depends(get_
         event_type = event.get("type")
         data = event.get("data", {})
     except Exception as e:
-        import traceback
-        raise HTTPException(status_code=500, detail={"msg": str(e), "tb": traceback.format_exc(), "event_repr": repr(event)})
+        import logging
+        logging.exception("Failed to parse Clerk webhook event structure")
+        raise HTTPException(status_code=400, detail="Malformed webhook payload")
 
     try:
         if event_type in ("user.created", "user.updated"):
@@ -56,10 +57,14 @@ async def handle_clerk_webhook(request: Request, db: AsyncSession = Depends(get_
             # event types we don't care about (sessions, invitations, etc.)
             return {"received": True, "handled": False}
 
-    except Exception as e:
-        import traceback
-        # Return full traceback and context for debugging
-        return {"error": str(e), "traceback": traceback.format_exc(), "event": repr(event), "data_repr": repr(data)}
+    except Exception:
+        import logging
+        # Log the full traceback server-side. Do NOT return it to Clerk —
+        # it leaks internal structure. Re-raise so FastAPI returns 500 and
+        # Clerk retries the webhook (returning 200 here would mark it as
+        # handled even though nothing was committed).
+        logging.exception("Unhandled error processing Clerk webhook event_type=%s", event_type)
+        raise HTTPException(status_code=500, detail="Webhook processing failed; will retry")
 
     await db.commit()
     return {"received": True, "handled": True}

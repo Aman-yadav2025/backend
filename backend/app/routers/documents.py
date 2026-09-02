@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
-from app.models import CompanyMember, Document, Profile, MemberRole, MemberStatus, DocumentStatus
+from app.models import CompanyMember, Document, Profile, MemberRole, MemberStatus, DocumentStatus, DocumentCategory
 from app.rate_limit import limiter
 from app.schemas import (
     DocumentCreate,
@@ -59,7 +59,7 @@ async def create_document_record(
     presigned upload_url — this writes the pointer row described in the
     README's document-storage flow.
     """
-    if not body.storage_key.startswith(f"companies/{company_id}/"):
+    if not body.storage_key.startswith(f"companies/{company_id}/") or ".." in body.storage_key:
         raise HTTPException(status_code=400, detail="storage_key does not belong to this company")
 
     if body.file_size_bytes > settings.r2_max_upload_bytes:
@@ -129,13 +129,6 @@ async def get_download_url(
     profile: Profile = Depends(get_current_profile),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Document).where(Document.id == document_id, Document.company_id == company_id)
-    )
-    document = result.scalar_one_or_none()
-    if document is None:
-        raise HTTPException(status_code=404, detail="Document not found")
-        
     member_role = _membership.member_role
     if _membership.id is not None:
         member_res = await db.execute(
@@ -148,9 +141,28 @@ async def get_download_url(
         if fresh_role is None:
             raise HTTPException(status_code=403, detail="Membership revoked")
         member_role = fresh_role
-        
-    if member_role != MemberRole.OWNER and document.uploaded_by_profile_id != profile.id:
-        raise HTTPException(status_code=403, detail="Not authorized to download this document")
+
+    # Fetch document AFTER membership is confirmed valid (prevents TOCTOU exposure)
+    result = await db.execute(
+        select(Document).where(Document.id == document_id, Document.company_id == company_id)
+    )
+    document = result.scalar_one_or_none()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    restricted_categories = {
+        DocumentCategory.COMPLIANCE,
+        DocumentCategory.TAX,
+        DocumentCategory.GST_CERTIFICATE,
+        DocumentCategory.PAN_CARD,
+        DocumentCategory.FACTORY_LICENSE,
+        DocumentCategory.CERTIFICATE_OF_INCORPORATION,
+        DocumentCategory.EPR_CERTIFICATE,
+        DocumentCategory.CANCELLED_CHEQUE,
+    }
+    if document.category in restricted_categories:
+        if member_role != MemberRole.OWNER and document.uploaded_by_profile_id != profile.id:
+            raise HTTPException(status_code=403, detail="Not authorized to download this restricted document")
 
     url = r2_storage.generate_presigned_download_url(document.storage_key)
     return DocumentDownloadResponse(download_url=url, expires_in_seconds=settings.r2_presigned_url_expiry_seconds)
@@ -213,7 +225,7 @@ async def reupload_document(
     Updates the existing document record to point to the new file and resets
     its status to PENDING_VERIFICATION.
     """
-    if not body.storage_key.startswith(f"companies/{company_id}/"):
+    if not body.storage_key.startswith(f"companies/{company_id}/") or ".." in body.storage_key:
         raise HTTPException(status_code=400, detail="storage_key does not belong to this company")
 
     if body.file_size_bytes > settings.r2_max_upload_bytes:
