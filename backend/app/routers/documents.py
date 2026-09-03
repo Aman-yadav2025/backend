@@ -1,7 +1,10 @@
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from datetime import datetime
+from typing import Literal, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -96,6 +99,13 @@ async def create_document_record(
 @router.get("", response_model=list[DocumentOut])
 async def list_documents(
     company_id: uuid.UUID,
+    document_name: Optional[str] = Query(default=None, description="Substring search on document name"),
+    category: Optional[DocumentCategory] = Query(default=None, description="Filter by exact document category"),
+    start_date: Optional[datetime] = Query(default=None, description="Filter documents uploaded on or after this date"),
+    end_date: Optional[datetime] = Query(default=None, description="Filter documents uploaded on or before this date"),
+    sort_by: Literal["date_desc", "date_asc", "size_desc", "size_asc"] = Query(default="date_desc"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     _membership: CompanyMember = Depends(require_active_company_membership),
     profile: Profile = Depends(get_current_profile),
     db: AsyncSession = Depends(get_db),
@@ -116,6 +126,26 @@ async def list_documents(
     query = select(Document).where(Document.company_id == company_id)
     if member_role != MemberRole.OWNER:
         query = query.where(Document.uploaded_by_profile_id == profile.id)
+        
+    if document_name is not None:
+        query = query.where(Document.file_name.ilike(f"%{document_name}%"))
+    if category is not None:
+        query = query.where(Document.category == category)
+    if start_date is not None:
+        query = query.where(Document.created_at >= start_date)
+    if end_date is not None:
+        query = query.where(Document.created_at <= end_date)
+
+    if sort_by == "date_asc":
+        query = query.order_by(Document.created_at.asc())
+    elif sort_by == "size_desc":
+        query = query.order_by(Document.file_size_bytes.desc())
+    elif sort_by == "size_asc":
+        query = query.order_by(Document.file_size_bytes.asc())
+    else:  # date_desc
+        query = query.order_by(Document.created_at.desc())
+
+    query = query.limit(limit).offset(offset)
         
     result = await db.execute(query)
     return result.scalars().all()

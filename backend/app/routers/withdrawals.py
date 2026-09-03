@@ -21,8 +21,9 @@ Endpoint summary:
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -230,13 +231,51 @@ async def request_withdrawal(
 @router.get("/withdrawals", response_model=list[WithdrawalRequestOut])
 async def list_withdrawals(
     company_id: uuid.UUID,
+    status: Optional[WithdrawalStatus] = Query(None, description="PENDING, APPROVED, or REJECTED"),
+    method: Optional[Literal["bank", "upi"]] = Query(None, description="Filter by destination type"),
+    min_amount: Optional[Decimal] = Query(None, ge=0),
+    max_amount: Optional[Decimal] = Query(None, ge=0),
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
+    sort_by: Literal["date_desc", "date_asc", "amount_desc", "amount_asc"] = Query("date_desc"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     _company: Company = Depends(_require_recycler_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all withdrawal requests for this Recycler, newest first."""
-    result = await db.execute(
+    """List all withdrawal requests for this Recycler with advanced filtering."""
+    base_query = (
         select(WithdrawalRequest)
+        .join(BankAccount, WithdrawalRequest.bank_account_id == BankAccount.id)
         .where(WithdrawalRequest.company_id == company_id)
-        .order_by(WithdrawalRequest.created_at.desc())
     )
+
+    if status is not None:
+        base_query = base_query.where(WithdrawalRequest.status == status)
+    
+    if method == "bank":
+        base_query = base_query.where(BankAccount.account_number.is_not(None))
+    elif method == "upi":
+        base_query = base_query.where(BankAccount.upi_id.is_not(None))
+
+    if min_amount is not None:
+        base_query = base_query.where(WithdrawalRequest.amount >= min_amount)
+    if max_amount is not None:
+        base_query = base_query.where(WithdrawalRequest.amount <= max_amount)
+
+    if start_date is not None:
+        base_query = base_query.where(WithdrawalRequest.created_at >= start_date)
+    if end_date is not None:
+        base_query = base_query.where(WithdrawalRequest.created_at <= end_date)
+
+    if sort_by == "date_asc":
+        base_query = base_query.order_by(WithdrawalRequest.created_at.asc())
+    elif sort_by == "amount_desc":
+        base_query = base_query.order_by(WithdrawalRequest.amount.desc())
+    elif sort_by == "amount_asc":
+        base_query = base_query.order_by(WithdrawalRequest.amount.asc())
+    else:
+        base_query = base_query.order_by(WithdrawalRequest.created_at.desc())
+
+    result = await db.execute(base_query.offset(offset).limit(limit))
     return result.scalars().all()

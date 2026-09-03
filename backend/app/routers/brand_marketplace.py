@@ -32,11 +32,14 @@ Endpoint summary:
 """
 
 import uuid
+from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import cast, case, func, select, text, Numeric
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import array
 
 from app.database import get_db
 from app.models import (
@@ -45,6 +48,7 @@ from app.models import (
     CompanyType,
     MaterialListing,
     MaterialPurchase,
+    MaterialType,
     PurchaseStatus,
     ArrivalStatus,
     PaymentMethod,
@@ -53,6 +57,9 @@ from app.models import (
 from app.services import razorpay_client
 from app.services.r2_storage import generate_presigned_download_url
 from app.schemas import (
+    BrandPurchasedFromFilter,
+    BrandPurchaseFilter,
+    MarketplaceSearchFilter,
     MaterialListingOut,
     MaterialPurchaseCreate,
     MaterialPurchaseOut,
@@ -155,59 +162,143 @@ async def _require_brand_admin(
     return company, _admin
 
 
-# ─── Browse listings ──────────────────────────────────────────────────────────
+# ─── Browse listings (Advanced Search) ───────────────────────────────────────
 
 @router.get("", response_model=list[MaterialListingOut])
 async def browse_listings(
     company_id: uuid.UUID,
-    material_type: str | None = None,
-    category: str | None = None,
-    recycler_id: uuid.UUID | None = None,
-    limit: int | None = None,
-    offset: int = 0,
+    # ── Material & Category ───────────────────────────────────────────────────
+    material_type: Optional[str] = Query(default=None, description="Exact match: PLASTIC, METAL, or BOTH."),
+    category: Optional[str] = Query(default=None, description="Substring (case-insensitive) search on category."),
+    grade: Optional[str] = Query(default=None, description="Substring (case-insensitive) search on grade."),
+    # ── Purity (JSONB) ────────────────────────────────────────────────────────
+    min_purity: Optional[Decimal] = Query(default=None, ge=0, le=100, description="Min purity % from technical_parameters."),
+    max_purity: Optional[Decimal] = Query(default=None, ge=0, le=100, description="Max purity % from technical_parameters."),
+    # ── Price ─────────────────────────────────────────────────────────────────
+    min_price: Optional[Decimal] = Query(default=None, ge=0, description="Minimum price per unit (₹)."),
+    max_price: Optional[Decimal] = Query(default=None, ge=0, description="Maximum price per unit (₹)."),
+    # ── Volume & Availability ──────────────────────────────────────────────────
+    min_quantity: Optional[Decimal] = Query(default=None, ge=0, description="Minimum available quantity."),
+    sold_out: Optional[bool] = Query(default=None, description="True=Sold out, False=Remaining inventory"),
+    # ── Certifications ────────────────────────────────────────────────────────
+    certifications: Optional[list[str]] = Query(default=None, description="Required certifications (ALL must match)."),
+    # ── Recycler / Location ───────────────────────────────────────────────────
+    recycler_id: Optional[uuid.UUID] = Query(default=None, description="Filter to a specific recycler."),
+    state: Optional[str] = Query(default=None, description="Substring search on recycler state."),
+    city: Optional[str] = Query(default=None, description="Substring search on recycler city."),
+    min_esg_rating: Optional[int] = Query(default=None, ge=0, le=100, description="Minimum recycler ESG rating."),
+    # ── Sorting & Pagination ──────────────────────────────────────────────────
+    sort_by: Literal["price_asc", "price_desc", "carbon_desc", "date_desc", "recommended"] = Query(default="date_desc", description="Sorting strategy."),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     deps: tuple[Company, CompanyMember] = Depends(_require_brand),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Returns all active recycler listings visible to Brands.
-    Optional query params: `material_type`, `category` for basic filtering.
+    Advanced search for all active recycler listings visible to this Brand.
+    All filters are optional and fully combinable.
+
+    **sort_by='recommended'** ranks listings that can best fulfill the brand's
+    remaining EPR credit deficit (epr_credits_required - epr_credits_purchased)
+    — listings that can single-handedly cover the gap appear first.
     """
+    brand_company, _ = deps
+
     q = select(
         MaterialListing,
         Company.name.label("recycler_name"),
         Company.city.label("recycler_city"),
-        Company.state.label("recycler_state")
+        Company.state.label("recycler_state"),
     ).outerjoin(Company, MaterialListing.recycler_id == Company.id).where(
         MaterialListing.is_active.is_(True),
         MaterialListing.created_by_brand_id.is_(None),
-        Company.deleted_at.is_(None)
+        Company.deleted_at.is_(None),
     )
 
+    # ── Apply filters ──────────────────────────────────────────────────────────
     if material_type is not None:
         q = q.where(MaterialListing.material_type == material_type)
     if category is not None:
         q = q.where(MaterialListing.category.ilike(f"%{category}%"))
+    if grade is not None:
+        q = q.where(MaterialListing.grade.ilike(f"%{grade}%"))
+    if min_price is not None:
+        q = q.where(MaterialListing.price_per_unit >= min_price)
+    if max_price is not None:
+        q = q.where(MaterialListing.price_per_unit <= max_price)
+    if min_quantity is not None:
+        q = q.where(MaterialListing.available_quantity >= min_quantity)
+    if sold_out is True:
+        q = q.where(MaterialListing.available_quantity == 0)
+    elif sold_out is False:
+        q = q.where(MaterialListing.available_quantity > 0)
     if recycler_id is not None:
         q = q.where(MaterialListing.recycler_id == recycler_id)
+    if state is not None:
+        q = q.where(Company.state.ilike(f"%{state}%"))
+    if city is not None:
+        q = q.where(Company.city.ilike(f"%{city}%"))
+    if min_esg_rating is not None:
+        q = q.where(Company.esg_rating >= min_esg_rating)
 
-    q = q.order_by(MaterialListing.created_at.desc())
-    if limit is not None:
-        q = q.limit(limit)
-    if offset > 0:
-        q = q.offset(offset)
-        
+    # Purity: cast the JSONB text value to NUMERIC for comparison.
+    # Rows where technical_parameters is NULL or the key is absent will have
+    # a NULL cast result, causing them to be excluded — the correct behaviour.
+    if min_purity is not None:
+        q = q.where(
+            cast(MaterialListing.technical_parameters["purity"].as_string(), Numeric)
+            >= min_purity
+        )
+    if max_purity is not None:
+        q = q.where(
+            cast(MaterialListing.technical_parameters["purity"].as_string(), Numeric)
+            <= max_purity
+        )
+
+    # Certifications: listing must contain ALL requested certs
+    if certifications:
+        cert_array = array(certifications)
+        q = q.where(MaterialListing.accreditations.contains(cert_array))
+
+    # ── Apply sorting ──────────────────────────────────────────────────────────
+    if sort_by == "price_asc":
+        q = q.order_by(MaterialListing.price_per_unit.asc())
+    elif sort_by == "price_desc":
+        q = q.order_by(MaterialListing.price_per_unit.desc())
+    elif sort_by == "carbon_desc":
+        q = q.order_by(MaterialListing.carbon_reduction_per_kg.desc().nulls_last())
+    elif sort_by == "recommended":
+        # Remaining EPR credits the brand still needs to fulfill
+        remaining = brand_company.epr_credits_required - brand_company.epr_credits_purchased
+        if remaining <= 0:
+            # No deficit — fall back to newest first
+            q = q.order_by(MaterialListing.created_at.desc())
+        else:
+            # 0 = can fulfill the gap entirely (best), 1 = cannot (goes last)
+            can_fulfill = case(
+                (MaterialListing.available_quantity >= remaining, 0),
+                else_=1,
+            )
+            # Among those that CAN fulfill: smallest surplus first
+            # Among those that CANNOT: largest quantity first (maximises partial coverage)
+            proximity = func.abs(MaterialListing.available_quantity - remaining)
+            q = q.order_by(can_fulfill.asc(), proximity.asc())
+    else:  # default: date_desc
+        q = q.order_by(MaterialListing.created_at.desc())
+
+    q = q.limit(limit).offset(offset)
+
     result = await db.execute(q)
     rows = result.all()
-    
+
     out_list = []
     for row in rows:
-        listing = row.MaterialListing
-        out = MaterialListingOut.model_validate(listing)
+        out = MaterialListingOut.model_validate(row.MaterialListing)
         out.recycler_name = row.recycler_name
         out.recycler_city = row.recycler_city
         out.recycler_state = row.recycler_state
         out_list.append(out)
-        
+
     return out_list
 
 
@@ -476,41 +567,141 @@ async def purchase_listing(
     return out
 
 
-# ─── List own purchases ───────────────────────────────────────────────────────
+# ─── List own purchases (Advanced Filter) ────────────────────────────────────
 
 @router.get("/purchases", response_model=list[MaterialPurchaseOut])
 async def list_purchases(
     company_id: uuid.UUID,
-    limit: int | None = None,
-    offset: int = 0,
+    # ── Status ────────────────────────────────────────────────────────────────
+    purchase_status: Optional[PurchaseStatus] = Query(default=None, description="Filter by purchase status."),
+    arrival_status: Optional[ArrivalStatus] = Query(default=None, description="Filter by arrival/delivery status."),
+    # ── Financial ─────────────────────────────────────────────────────────────
+    payment_method: Optional[PaymentMethod] = Query(default=None, description="WALLET or DIRECT."),
+    min_amount: Optional[Decimal] = Query(default=None, ge=0, description="Minimum total price (₹)."),
+    max_amount: Optional[Decimal] = Query(default=None, ge=0, description="Maximum total price (₹)."),
+    # ── Search ────────────────────────────────────────────────────────────────
+    category: Optional[str] = Query(default=None, description="Substring search on purchase category."),
+    recycler_name: Optional[str] = Query(default=None, description="Substring search on recycler company name."),
+    # ── Date Range ────────────────────────────────────────────────────────────
+    start_date: Optional[datetime] = Query(default=None, description="Filter purchases created on or after this datetime (UTC)."),
+    end_date: Optional[datetime] = Query(default=None, description="Filter purchases created on or before this datetime (UTC)."),
+    # ── Sorting & Pagination ──────────────────────────────────────────────────
+    sort_by: Literal["date_desc", "date_asc", "amount_desc", "amount_asc"] = Query(default="date_desc"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     deps: tuple[Company, CompanyMember] = Depends(_require_brand),
     db: AsyncSession = Depends(get_db),
 ):
-    """Returns all purchases made by this brand, newest first."""
+    """
+    Returns the brand's purchase orders with advanced filtering.
+    Covers both the Delivery Tracking and Purchased Invoices views.
+    All filters are optional and fully combinable.
+    """
+    # Base query — join MaterialListing and Company to enable recycler name search
     query = (
-        select(MaterialPurchase)
+        select(MaterialPurchase, Company.name.label("recycler_name"))
+        .join(MaterialListing, MaterialPurchase.listing_id == MaterialListing.id, isouter=True)
+        .join(Company, MaterialListing.recycler_id == Company.id, isouter=True)
         .where(MaterialPurchase.brand_id == company_id)
-        .order_by(MaterialPurchase.created_at.desc())
     )
-    if limit is not None:
-        query = query.limit(limit)
-    if offset > 0:
-        query = query.offset(offset)
-        
-    result = await db.execute(query)
-    purchases = result.scalars().all()
 
-    # immediate_deduction is not stored — reconstruct it from total_price and pending.
-    # For DIRECT purchases nothing was deducted from the wallet, so it is always 0.
+    # ── Apply filters ──────────────────────────────────────────────────────────
+    if purchase_status is not None:
+        query = query.where(MaterialPurchase.purchase_status == purchase_status)
+    if arrival_status is not None:
+        query = query.where(MaterialPurchase.arrival_status == arrival_status)
+    if payment_method is not None:
+        query = query.where(MaterialPurchase.payment_method == payment_method)
+    if min_amount is not None:
+        query = query.where(MaterialPurchase.total_price >= min_amount)
+    if max_amount is not None:
+        query = query.where(MaterialPurchase.total_price <= max_amount)
+    if category is not None:
+        query = query.where(MaterialPurchase.category.ilike(f"%{category}%"))
+    if recycler_name is not None:
+        query = query.where(Company.name.ilike(f"%{recycler_name}%"))
+    if start_date is not None:
+        query = query.where(MaterialPurchase.created_at >= start_date)
+    if end_date is not None:
+        query = query.where(MaterialPurchase.created_at <= end_date)
+
+    # ── Apply sorting ──────────────────────────────────────────────────────────
+    if sort_by == "date_asc":
+        query = query.order_by(MaterialPurchase.created_at.asc())
+    elif sort_by == "amount_desc":
+        query = query.order_by(MaterialPurchase.total_price.desc())
+    elif sort_by == "amount_asc":
+        query = query.order_by(MaterialPurchase.total_price.asc())
+    else:  # date_desc (default)
+        query = query.order_by(MaterialPurchase.created_at.desc())
+
+    query = query.limit(limit).offset(offset)
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    # immediate_deduction is not stored — reconstruct from total_price and pending.
     out = []
-    for p in purchases:
+    for row in rows:
+        p = row.MaterialPurchase
         item = MaterialPurchaseOut.model_validate(p)
         if p.payment_method == PaymentMethod.DIRECT:
             item.immediate_deduction = Decimal("0.00")
         else:
             item.immediate_deduction = p.total_price - p.pending_wallet_deduction
+        item.recycler_name = row.recycler_name
         out.append(item)
     return out
+
+
+@router.get("/purchased-from-recyclers", response_model=list[RecyclerProfileOut])
+async def list_purchased_from_recyclers(
+    company_id: uuid.UUID,
+    name: Optional[str] = Query(default=None, description="Substring (case-insensitive) search on recycler company name."),
+    state: Optional[str] = Query(default=None, description="Substring search on recycler state."),
+    city: Optional[str] = Query(default=None, description="Substring search on recycler city."),
+    material: Optional[MaterialType] = Query(default=None, description="Exact match on recycler material type (PLASTIC/METAL/BOTH)."),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    deps: tuple[Company, CompanyMember] = Depends(_require_brand),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns the distinct set of Recycler companies from whom this brand has
+    made at least one purchase, with optional filtering by name, location,
+    and material type.
+    """
+    # Base query: distinct Recycler companies this brand has bought from
+    query = (
+        select(Company)
+        .join(MaterialListing, MaterialListing.recycler_id == Company.id)
+        .join(MaterialPurchase, MaterialPurchase.listing_id == MaterialListing.id)
+        .where(
+            MaterialPurchase.brand_id == company_id,
+            MaterialPurchase.purchase_status != PurchaseStatus.CANCELLED,
+            Company.deleted_at.is_(None),
+        )
+        .distinct()
+    )
+
+    # ── Apply filters ──────────────────────────────────────────────────────────
+    if name is not None:
+        query = query.where(Company.name.ilike(f"%{name}%"))
+    if state is not None:
+        query = query.where(Company.state.ilike(f"%{state}%"))
+    if city is not None:
+        query = query.where(Company.city.ilike(f"%{city}%"))
+    if material is not None:
+        if material in (MaterialType.PLASTIC, MaterialType.METAL):
+            query = query.where(Company.material.in_([material, MaterialType.BOTH]))
+        else:
+            query = query.where(Company.material == material)
+
+    query = query.order_by(Company.name.asc()).limit(limit).offset(offset)
+
+    result = await db.execute(query)
+    recyclers = result.scalars().all()
+    return [RecyclerProfileOut.model_validate(r) for r in recyclers]
 
 
 # ─── Download Invoice ─────────────────────────────────────────────────────────

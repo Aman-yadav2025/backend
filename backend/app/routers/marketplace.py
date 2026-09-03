@@ -20,10 +20,12 @@ Invoice / Risk flow:
   - No invoice present → validity_risk is always forced to "HIGHEST RISK".
 """
 
+from datetime import datetime
 import uuid
 from decimal import Decimal
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,7 +37,10 @@ from app.models import (
     Document,
     MaterialListing,
     MaterialPurchase,
+    MaterialType,
     PurchaseStatus,
+    PaymentMethod,
+    ArrivalStatus,
 )
 from app.schemas import (
     MaterialListingCreate,
@@ -44,6 +49,7 @@ from app.schemas import (
     MaterialListingUpdate,
     MaterialPurchaseOut,
     ArrivalStatusUpdate,
+    BrandProfileOut,
 )
 from app.security import require_company_admin
 from app.services.risk_evaluator import evaluate_listing_risk
@@ -183,14 +189,19 @@ async def create_listing(
 @router.get("", response_model=list[MaterialListingOut])
 async def list_listings(
     company_id: uuid.UUID,
+    material_type: Optional[MaterialType] = Query(None),
+    category: Optional[str] = Query(None),
+    grade: Optional[str] = Query(None),
+    min_price: Optional[Decimal] = Query(None),
+    sold_out: Optional[bool] = Query(None, description="True=Sold out, False=Remaining inventory"),
     include_inactive: bool = False,
-    limit: int | None = None,
-    offset: int = 0,
+    limit: int | None = Query(None, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     _admin: CompanyMember = Depends(require_company_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Returns all listings for the recycler's company.
+    Returns all listings for the recycler's company with advanced filtering.
     Pass `?include_inactive=true` to also see deactivated listings.
     """
     company = await db.scalar(
@@ -209,6 +220,21 @@ async def list_listings(
     ).outerjoin(Company, MaterialListing.recycler_id == Company.id)
     
     q = q.where(MaterialListing.recycler_id == company_id)
+
+    if material_type is not None:
+        q = q.where(MaterialListing.material_type == material_type)
+    if category is not None:
+        q = q.where(MaterialListing.category.ilike(f"%{category}%"))
+    if grade is not None:
+        q = q.where(MaterialListing.grade.ilike(f"%{grade}%"))
+    if min_price is not None:
+        q = q.where(MaterialListing.price_per_unit >= min_price)
+    
+    if sold_out is True:
+        q = q.where(MaterialListing.available_quantity == 0)
+    elif sold_out is False:
+        q = q.where(MaterialListing.available_quantity > 0)
+
     if not include_inactive:
         q = q.where(MaterialListing.is_active.is_(True))
     q = q.order_by(MaterialListing.created_at.desc())
@@ -504,3 +530,124 @@ async def update_purchase_arrival_status(
     out = MaterialPurchaseOut.model_validate(purchase)
     out.immediate_deduction = Decimal("0.00")
     return out
+
+
+# ─── List order history ───────────────────────────────────────────────────────
+
+@router.get("/orders", response_model=list[MaterialPurchaseOut])
+async def list_orders(
+    company_id: uuid.UUID,
+    purchase_status: Optional[PurchaseStatus] = Query(None),
+    arrival_status: Optional[ArrivalStatus] = Query(None),
+    payment_method: Optional[PaymentMethod] = Query(None),
+    category: Optional[str] = Query(None, description="Substring search on material category"),
+    brand_name: Optional[str] = Query(None, description="Substring search on the buying brand's name"),
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
+    sort_by: Literal["date_asc", "date_desc", "amount_asc", "amount_desc"] = Query("date_desc"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    company: Company = Depends(_require_recycler_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns the recycler's order history (purchases made by Brands against their listings).
+    Includes advanced filters for status, payment method, category, brand name, and date.
+    """
+    # Join MaterialListing to ensure it belongs to this recycler.
+    # Join Company on brand_id to get the buying Brand's name.
+    query = (
+        select(MaterialPurchase, Company.name.label("brand_name"))
+        .join(MaterialListing, MaterialPurchase.listing_id == MaterialListing.id)
+        .join(Company, MaterialPurchase.brand_id == Company.id, isouter=True)
+        .where(MaterialListing.recycler_id == company_id)
+    )
+
+    if purchase_status is not None:
+        query = query.where(MaterialPurchase.purchase_status == purchase_status)
+    if arrival_status is not None:
+        query = query.where(MaterialPurchase.arrival_status == arrival_status)
+    if payment_method is not None:
+        query = query.where(MaterialPurchase.payment_method == payment_method)
+    if category is not None:
+        query = query.where(MaterialPurchase.category.ilike(f"%{category}%"))
+    if brand_name is not None:
+        query = query.where(Company.name.ilike(f"%{brand_name}%"))
+    if start_date is not None:
+        query = query.where(MaterialPurchase.created_at >= start_date)
+    if end_date is not None:
+        query = query.where(MaterialPurchase.created_at <= end_date)
+
+    if sort_by == "date_asc":
+        query = query.order_by(MaterialPurchase.created_at.asc())
+    elif sort_by == "amount_desc":
+        query = query.order_by(MaterialPurchase.total_price.desc())
+    elif sort_by == "amount_asc":
+        query = query.order_by(MaterialPurchase.total_price.asc())
+    else:
+        query = query.order_by(MaterialPurchase.created_at.desc())
+
+    query = query.limit(limit).offset(offset)
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    out = []
+    for row in rows:
+        p = row.MaterialPurchase
+        item = MaterialPurchaseOut.model_validate(p)
+        if p.payment_method == PaymentMethod.DIRECT:
+            item.immediate_deduction = Decimal("0.00")
+        else:
+            item.immediate_deduction = p.total_price - p.pending_wallet_deduction
+        item.brand_name = row.brand_name
+        out.append(item)
+    return out
+
+
+# ─── List purchased by brands ────────────────────────────────────────────────
+
+@router.get("/purchased-by-brands", response_model=list[BrandProfileOut])
+async def list_purchased_by_brands(
+    company_id: uuid.UUID,
+    name: Optional[str] = Query(None, description="Substring search on brand company name."),
+    state: Optional[str] = Query(None, description="Substring search on brand state."),
+    city: Optional[str] = Query(None, description="Substring search on brand city."),
+    material: Optional[MaterialType] = Query(None, description="Exact match on brand company material type."),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    company: Company = Depends(_require_recycler_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns the distinct Brand companies that have purchased from this Recycler.
+    """
+    # Using a JOIN instead of a subquery for performance.
+    query = (
+        select(Company)
+        .join(MaterialPurchase, MaterialPurchase.brand_id == Company.id)
+        .join(MaterialListing, MaterialPurchase.listing_id == MaterialListing.id)
+        .where(
+            MaterialListing.recycler_id == company_id,
+            MaterialPurchase.purchase_status != PurchaseStatus.CANCELLED,
+            Company.deleted_at.is_(None),
+        )
+        .distinct()
+    )
+
+    if name is not None:
+        query = query.where(Company.name.ilike(f"%{name}%"))
+    if state is not None:
+        query = query.where(Company.state.ilike(f"%{state}%"))
+    if city is not None:
+        query = query.where(Company.city.ilike(f"%{city}%"))
+    if material is not None:
+        query = query.where(Company.material == material)
+
+    # Standard offset/limit works fine in PostgreSQL after distinct if no specific sort is required
+    # But since distinct in PG takes the first columns, we order by Company.id for deterministic pagination.
+    # Note: DISTINCT without ON applies to all columns in the SELECT list.
+    query = query.limit(limit).offset(offset)
+
+    result = await db.execute(query)
+    return result.scalars().all()

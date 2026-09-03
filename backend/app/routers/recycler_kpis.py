@@ -1,7 +1,7 @@
 import uuid
 from decimal import Decimal
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 from collections import defaultdict
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -370,6 +370,13 @@ async def get_recycler_invoice_stats(
 @router.get("/wallet-review", response_model=RecyclerWalletReview)
 async def get_recycler_wallet_review(
     company_id: uuid.UUID,
+    company_name: Optional[str] = Query(None, description="Substring search on the Brand's name"),
+    invoice_no: Optional[str] = Query(None, description="Substring search on the short invoice ID"),
+    status: Optional[str] = Query(None, description="Exact match on the computed deal status (e.g. 'Delivered', 'Pending')"),
+    start_date: Optional[datetime] = Query(None, description="Filter deals created on or after this date"),
+    end_date: Optional[datetime] = Query(None, description="Filter deals created on or before this date"),
+    min_amount: Optional[Decimal] = Query(None, ge=0, description="Minimum deal amount"),
+    max_amount: Optional[Decimal] = Query(None, ge=0, description="Maximum deal amount"),
     offset: int = Query(0, ge=0),
     limit: int = Query(10, gt=0, le=100),
     admin_member: CompanyMember = Depends(require_company_admin),
@@ -401,13 +408,50 @@ async def get_recycler_wallet_review(
     total_paid = totals_res.paid or Decimal("0.00")
     total_count = totals_res.total_count or 0
 
-    # 2. Get paginated invoices
+    # 3. Get paginated invoices
     base_query = (
         select(MaterialPurchase, Company)
         .join(MaterialListing, MaterialPurchase.listing_id == MaterialListing.id)
         .join(Company, MaterialPurchase.brand_id == Company.id)
         .where(MaterialListing.recycler_id == company_id)
     )
+    
+    if company_name:
+        base_query = base_query.where(Company.name.ilike(f"%{company_name}%"))
+    if invoice_no:
+        base_query = base_query.where(MaterialPurchase.id.cast(Text).ilike(f"%{invoice_no}%"))
+    if start_date:
+        base_query = base_query.where(MaterialPurchase.created_at >= start_date)
+    if end_date:
+        base_query = base_query.where(MaterialPurchase.created_at <= end_date)
+    if min_amount is not None:
+        base_query = base_query.where(MaterialPurchase.total_price >= min_amount)
+    if max_amount is not None:
+        base_query = base_query.where(MaterialPurchase.total_price <= max_amount)
+
+    if status:
+        if status.lower() == "cancelled":
+            base_query = base_query.where(MaterialPurchase.purchase_status == PurchaseStatus.CANCELLED)
+        elif status.lower() == "pending":
+            base_query = base_query.where(MaterialPurchase.purchase_status == PurchaseStatus.PENDING)
+        elif status.lower() == "awaiting payment":
+            base_query = base_query.where(MaterialPurchase.purchase_status == PurchaseStatus.AWAITING_PAYMENT)
+        else:
+            # For arrival statuses, the purchase_status must be CONFIRMED (i.e. not in the initial 3 states)
+            base_query = base_query.where(
+                MaterialPurchase.purchase_status.not_in(
+                    [PurchaseStatus.CANCELLED, PurchaseStatus.PENDING, PurchaseStatus.AWAITING_PAYMENT]
+                )
+            )
+            if status.lower() == "processing":
+                base_query = base_query.where(MaterialPurchase.arrival_status == ArrivalStatus.PENDING)
+            elif status.lower() == "ready to ship":
+                base_query = base_query.where(MaterialPurchase.arrival_status == ArrivalStatus.READY_TO_SHIP)
+            elif status.lower() == "in transit":
+                base_query = base_query.where(MaterialPurchase.arrival_status == ArrivalStatus.IN_TRANSIT)
+            elif status.lower() == "delivered":
+                base_query = base_query.where(MaterialPurchase.arrival_status == ArrivalStatus.DELIVERED)
+
     invoices_query = base_query.order_by(MaterialPurchase.created_at.desc()).offset(offset).limit(limit)
     invoices_res = await db.execute(invoices_query)
 
@@ -449,8 +493,14 @@ async def get_recycler_wallet_review(
 @router.get("/invoice-ledger", response_model=InvoiceLedgerResponse)
 async def get_recycler_invoice_ledger(
     company_id: uuid.UUID,
-    offset: int = 0,
-    limit: int | None = None,
+    invoice_no: Optional[str] = Query(None, description="Substring search on the short invoice ID"),
+    deal_type: Optional[Literal["SALE", "PURCHASE"]] = Query(None, description="Filter by SALE (Brand deals) or PURCHASE (Collector deals)"),
+    start_date: Optional[datetime] = Query(None, description="Filter invoices created on or after this date"),
+    end_date: Optional[datetime] = Query(None, description="Filter invoices created on or before this date"),
+    party_name: Optional[str] = Query(None, description="Substring search on Customer (Brand) or Provider (Collector) name"),
+    category: Optional[str] = Query(None, description="Substring search on material category"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
     admin_member: CompanyMember = Depends(require_company_admin),
     db: AsyncSession = Depends(get_db),
 ):
@@ -501,12 +551,29 @@ async def get_recycler_invoice_ledger(
 
     union_subq = union_all(q1, q2).subquery()
     
+    filtered_query = select(union_subq)
+    
+    if invoice_no:
+        # The frontend sees the first 8 chars uppercase as the invoice_no.
+        # We can case-insensitive search the UUID casted to text.
+        filtered_query = filtered_query.where(union_subq.c.id.ilike(f"%{invoice_no}%"))
+    if deal_type:
+        filtered_query = filtered_query.where(union_subq.c.deal_type == deal_type)
+    if start_date:
+        filtered_query = filtered_query.where(union_subq.c.created_at >= start_date)
+    if end_date:
+        filtered_query = filtered_query.where(union_subq.c.created_at <= end_date)
+    if party_name:
+        filtered_query = filtered_query.where(union_subq.c.supplier.ilike(f"%{party_name}%"))
+    if category:
+        filtered_query = filtered_query.where(union_subq.c.category.ilike(f"%{category}%"))
+    
     # Get total count
-    count_query = select(func.count()).select_from(union_subq)
+    count_query = select(func.count()).select_from(filtered_query.subquery())
     total_count = (await db.execute(count_query)).scalar() or 0
 
     # Get paginated data (Deterministic Sort)
-    data_query = select(union_subq).order_by(
+    data_query = filtered_query.order_by(
         union_subq.c.created_at.desc(),
         union_subq.c.id.asc()
     )
@@ -770,32 +837,102 @@ async def create_invoice_proof(
 @router.get("/invoice-proofs", response_model=InvoiceProofListResponse)
 async def list_invoice_proofs(
     company_id: uuid.UUID,
+    # ── Category ──────────────────────────────────────────────────────────────
+    category: Optional[InvoiceProofCategory] = Query(default=None, description="Filter by category (ELECTRICITY/WATER/LOGISTICS/FUEL)."),
+    # ── Search Term ───────────────────────────────────────────────────────────
+    document_name: Optional[str] = Query(default=None, description="Substring (case-insensitive) search on document_name."),
+    period: Optional[str] = Query(default=None, description="Substring search on the period string (e.g. '2024-01')."),
+    # ── Financial Ranges ──────────────────────────────────────────────────────
+    min_amount_spent: Optional[Decimal] = Query(default=None, ge=0, description="Minimum amount_spent (₹)."),
+    max_amount_spent: Optional[Decimal] = Query(default=None, ge=0, description="Maximum amount_spent (₹)."),
+    min_total_amount_used: Optional[Decimal] = Query(default=None, ge=0, description="Minimum total_amount_used."),
+    max_total_amount_used: Optional[Decimal] = Query(default=None, ge=0, description="Maximum total_amount_used."),
+    # ── Date Range ────────────────────────────────────────────────────────────
+    start_date: Optional[datetime] = Query(default=None, description="Filter records created on or after this datetime (UTC)."),
+    end_date: Optional[datetime] = Query(default=None, description="Filter records created on or before this datetime (UTC)."),
+    # ── Sorting & Pagination ──────────────────────────────────────────────────
+    sort_by: Literal["date_desc", "date_asc", "amount_desc", "amount_asc"] = Query(default="date_desc"),
     offset: int = Query(0, ge=0),
-    limit: int = Query(10, gt=0, le=100),
+    limit: int = Query(10, gt=0, le=200),
     admin_member: CompanyMember = Depends(require_company_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    List all uploaded invoice proofs for the recycler, with pagination and download links.
+    List invoice proofs for the recycler with advanced filtering.
+    All filters are optional and fully combinable.
     """
-    # Base query joining Document to get storage_key (document_url)
+    # Base query — selects InvoiceProof rows only.
+    # We do NOT need to join Document here: InvoiceProof.document_id is the FK
+    # to Document.id, so they are the same UUID. The download URL is constructed
+    # directly from proof.document_id.
     base_query = (
-        select(InvoiceProof, Document.id.label("document_id"))
-        .outerjoin(Document, InvoiceProof.document_id == Document.id)
+        select(InvoiceProof)
         .where(InvoiceProof.recycler_id == company_id)
     )
-    
-    # Get total count
-    count_query = select(func.count()).select_from(base_query.subquery())
+
+    # ── Apply filters ──────────────────────────────────────────────────────────
+    if category is not None:
+        base_query = base_query.where(InvoiceProof.category == category)
+    if document_name is not None:
+        base_query = base_query.where(InvoiceProof.document_name.ilike(f"%{document_name}%"))
+    if period is not None:
+        base_query = base_query.where(InvoiceProof.period.ilike(f"%{period}%"))
+    if min_amount_spent is not None:
+        base_query = base_query.where(InvoiceProof.amount_spent >= min_amount_spent)
+    if max_amount_spent is not None:
+        base_query = base_query.where(InvoiceProof.amount_spent <= max_amount_spent)
+    if min_total_amount_used is not None:
+        base_query = base_query.where(InvoiceProof.total_amount_used >= min_total_amount_used)
+    if max_total_amount_used is not None:
+        base_query = base_query.where(InvoiceProof.total_amount_used <= max_total_amount_used)
+    if start_date is not None:
+        base_query = base_query.where(InvoiceProof.created_at >= start_date)
+    if end_date is not None:
+        base_query = base_query.where(InvoiceProof.created_at <= end_date)
+
+    # ── Get total count on filtered rows (before sort + pagination) ───────────
+    # Count directly on InvoiceProof rows matching all filters, without going
+    # through the outer-joined subquery (avoids column name aliasing issues).
+    count_query = (
+        select(func.count(InvoiceProof.id))
+        .where(InvoiceProof.recycler_id == company_id)
+    )
+    if category is not None:
+        count_query = count_query.where(InvoiceProof.category == category)
+    if document_name is not None:
+        count_query = count_query.where(InvoiceProof.document_name.ilike(f"%{document_name}%"))
+    if period is not None:
+        count_query = count_query.where(InvoiceProof.period.ilike(f"%{period}%"))
+    if min_amount_spent is not None:
+        count_query = count_query.where(InvoiceProof.amount_spent >= min_amount_spent)
+    if max_amount_spent is not None:
+        count_query = count_query.where(InvoiceProof.amount_spent <= max_amount_spent)
+    if min_total_amount_used is not None:
+        count_query = count_query.where(InvoiceProof.total_amount_used >= min_total_amount_used)
+    if max_total_amount_used is not None:
+        count_query = count_query.where(InvoiceProof.total_amount_used <= max_total_amount_used)
+    if start_date is not None:
+        count_query = count_query.where(InvoiceProof.created_at >= start_date)
+    if end_date is not None:
+        count_query = count_query.where(InvoiceProof.created_at <= end_date)
     total_count = (await db.execute(count_query)).scalar() or 0
 
-    # Get paginated data
-    data_query = base_query.order_by(InvoiceProof.created_at.desc()).offset(offset).limit(limit)
+    # ── Apply sorting ──────────────────────────────────────────────────────────
+    if sort_by == "date_asc":
+        base_query = base_query.order_by(InvoiceProof.created_at.asc())
+    elif sort_by == "amount_desc":
+        base_query = base_query.order_by(InvoiceProof.amount_spent.desc())
+    elif sort_by == "amount_asc":
+        base_query = base_query.order_by(InvoiceProof.amount_spent.asc())
+    else:  # date_desc (default)
+        base_query = base_query.order_by(InvoiceProof.created_at.desc())
+
+    # ── Get paginated data ────────────────────────────────────────────────────
+    data_query = base_query.offset(offset).limit(limit)
     res = await db.execute(data_query)
-    
+
     items = []
-    for row in res.all():
-        proof = row.InvoiceProof
+    for proof in res.scalars().all():
         items.append(InvoiceProofOut(
             id=proof.id,
             invoice_id=proof.invoice_id,
@@ -807,14 +944,15 @@ async def list_invoice_proofs(
             total_amount_used=proof.total_amount_used,
             total_amount_recycled=proof.total_amount_recycled,
             document_id=proof.document_id,
-            document_url=f"/companies/{company_id}/documents/{row.document_id}/download" if row.document_id else None,
-            created_at=proof.created_at
+            document_url=f"/companies/{company_id}/documents/{proof.document_id}/download" if proof.document_id else None,
+            created_at=proof.created_at,
         ))
 
     return InvoiceProofListResponse(
         items=items,
         total_count=total_count
     )
+
 
 
 @router.patch("/invoice-proofs/{proof_id}", response_model=InvoiceProofOut)

@@ -2,13 +2,39 @@
 
 Implements the core backend architecture using **FastAPI** (business logic), **Supabase PostgreSQL** (database), **Cloudflare R2** (document storage), **Razorpay** (payments), and **Clerk** (identity).
 
-## 🚀 Key Features
+## 🚀 Comprehensive Feature Set
+
+### 1. Identity & RBAC (Authentication)
 - **Stateless Authentication**: Fast JWT validation via Clerk's JWKS.
-- **Role-Based Access Control (RBAC)**: Comprehensive permission modeling for `PLATFORM_ADMIN`, `OWNER`, `ADMIN`, and `MEMBER`.
-- **B2B Material Marketplace**: End-to-end B2B buying/selling marketplace functionality between Brands and Recyclers.
-- **Recycler & Brand KPIs**: Real-time aggregated financial reports, material tracking, deal statuses, and collector spend summaries.
-- **Secure File Storage**: Cloudflare R2 integration using short-lived Presigned URLs for direct, secure client-side uploads and downloads.
-- **Payments & Wallets**: Razorpay integration for B2B wallet recharges, automated ledger tracking, and robust DB row-level concurrency locks to prevent race conditions during checkouts and refunds.
+- **Hierarchical Access Control**: Strong permission modeling for `PLATFORM_ADMIN`, `OWNER`, `ADMIN`, and `MEMBER`.
+- **Profiles & Companies**: Complete onboarding flows for Brands and Recyclers, mapping Clerk users to internal profiles and company memberships.
+
+### 2. Recycler & Brand Marketplace (B2B Deals)
+- **Listings & Offers**: Recyclers can create material listings; Brands can accept them directly.
+- **Unified Order History**: 
+  - Recyclers can view `GET /listings/orders` for all incoming brand deals.
+  - Brands can view `GET /listings/purchased-by-brands` for all their material purchases.
+- **Status Lifecycle**: Built-in state machine for tracking deals (`purchase_status`, `arrival_status`).
+
+### 3. Collector Purchases (Supply Chain)
+- **Scrap Logging**: Recyclers can log incoming scrap purchases from informal waste collectors.
+- **Advanced Filtering**: `GET /collector-purchases` supports robust search by `party_name`, `deal_status`, `min_amount`, `max_amount`, `start_date`, and `end_date`.
+
+### 4. Recycler Dashboard & KPIs (Financial & Operational)
+- **Collector Spend Summary**: Monthly aggregations of spending across categories.
+- **Invoice Ledger**: A unified timeline of all financial invoices (Brand sales & Collector purchases) via `GET /kpis/invoice-ledger`. Supports advanced filtering by `invoice_no`, `deal_type`, `category`, `start_date`, etc.
+- **Wallet Review**: Real-time aggregation of pending vs. received payments from Brands, including paginated lists of Brand invoices. Supports filtering by `company_name`, `status`, `invoice_no`, and `min_amount`/`max_amount`.
+- **Operational Proofs (EPR)**: Specialized endpoints for tracking recycled utility metrics (electricity, water) and attaching proof documents.
+
+### 5. Unified Document Vault (Cloudflare R2)
+- **Secure File Storage**: Presigned URL generation for direct, secure client-side uploads and downloads.
+- **Centralized Document API**: All company documents (Invoices, Utility Bills, Certificates) are queryable via `GET /documents`.
+- **Advanced Search**: Filter documents by `document_name` (substring), `category` (enum), `start_date`, and `end_date`.
+
+### 6. Payments & Wallets (Razorpay)
+- **B2B Wallet Recharges**: Brands can recharge their internal platform wallets via Razorpay.
+- **Webhooks**: Secure verification of Razorpay webhooks to automatically credit wallets on payment success.
+- **Concurrency Locks**: Robust PostgreSQL row-level locks (`SELECT FOR UPDATE`) to prevent race conditions during checkouts, refunds, and wallet updates.
 
 ---
 

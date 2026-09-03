@@ -85,6 +85,19 @@ class CompanyOut(BaseModel):
     updated_at: datetime
 
 
+class BrandProfileOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    city: str
+    state: str
+    contact_person_name: str
+    mobile_number: str
+    company_email: str
+    gst_number: str
+
+
 class RecyclerProfileOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -619,6 +632,8 @@ class MaterialPurchaseOut(BaseModel):
     razorpay_order_id: str | None = None
     razorpay_payment_id: str | None = None
     arrival_status: ArrivalStatus
+    recycler_name: str | None = None
+    brand_name: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -1011,6 +1026,199 @@ class UtilityMetricsKPIs(BaseModel):
     waybill_verified_scrap: Decimal
     recorded_utility_invoices: Decimal
     verified_proof_files: int
+
+
+# ============================================================================
+# Advanced Search Filters
+# ============================================================================
+
+class MarketplaceSearchFilter(BaseModel):
+    """
+    Advanced search filters for the Brand Marketplace listing browse endpoint.
+    All fields are optional — any combination may be supplied simultaneously.
+    """
+    # ── Material & Category ───────────────────────────────────────────────────
+    material_type: MaterialType | None = Field(default=None, description="Exact match on material type (PLASTIC / METAL / BOTH).")
+    category: str | None = Field(default=None, description="Substring (case-insensitive) search on listing category.")
+    grade: str | None = Field(default=None, description="Substring (case-insensitive) search on material grade.")
+
+    # ── Purity (from technical_parameters JSONB) ──────────────────────────────
+    min_purity: Decimal | None = Field(default=None, ge=0, le=100, description="Minimum purity % stored in technical_parameters->>'purity'.")
+    max_purity: Decimal | None = Field(default=None, ge=0, le=100, description="Maximum purity % stored in technical_parameters->>'purity'.")
+
+    # ── Price Range ───────────────────────────────────────────────────────────
+    min_price: Decimal | None = Field(default=None, ge=0, description="Minimum price per unit (₹).")
+    max_price: Decimal | None = Field(default=None, ge=0, description="Maximum price per unit (₹).")
+
+    # ── Volume / Availability ─────────────────────────────────────────────────
+    min_quantity: Decimal | None = Field(default=None, ge=0, description="Minimum available_quantity required.")
+
+    # ── Certifications / Accreditations ──────────────────────────────────────
+    certifications: list[str] | None = Field(default=None, description="List of required accreditation strings. Listings must possess ALL of them.")
+
+    # ── Recycler / Location ───────────────────────────────────────────────────
+    recycler_id: uuid.UUID | None = Field(default=None, description="Filter to a specific recycler company ID.")
+    state: str | None = Field(default=None, description="Substring search on recycler state.")
+    city: str | None = Field(default=None, description="Substring search on recycler city.")
+    min_esg_rating: int | None = Field(default=None, ge=0, le=100, description="Minimum ESG rating of the recycler company.")
+
+    # ── Sorting ───────────────────────────────────────────────────────────────
+    sort_by: Literal["price_asc", "price_desc", "carbon_desc", "date_desc", "recommended"] = Field(
+        default="date_desc",
+        description=(
+            "Sorting strategy. 'recommended' requires the brand's remaining EPR credits "
+            "(epr_credits_required - epr_credits_purchased) to rank listings that best "
+            "fulfill the deficit first."
+        ),
+    )
+
+    # ── Pagination ────────────────────────────────────────────────────────────
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_price_range(self) -> "MarketplaceSearchFilter":
+        if self.min_price is not None and self.max_price is not None:
+            if self.min_price > self.max_price:
+                raise ValueError("min_price must be <= max_price")
+        if self.min_purity is not None and self.max_purity is not None:
+            if self.min_purity > self.max_purity:
+                raise ValueError("min_purity must be <= max_purity")
+        return self
+
+
+class BrandPurchasedFromFilter(BaseModel):
+    """
+    Filter/search for the 'Purchased From' supplier directory visible to Brands.
+    Returns the distinct recycler companies from whom the brand has made purchases.
+    """
+    name: str | None = Field(default=None, description="Substring (case-insensitive) search on recycler company name.")
+    state: str | None = Field(default=None, description="Substring search on recycler state.")
+    city: str | None = Field(default=None, description="Substring search on recycler city.")
+    material: MaterialType | None = Field(default=None, description="Exact match on recycler company material type.")
+
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+
+
+class BrandPurchaseFilter(BaseModel):
+    """
+    Advanced filter for a Brand's own purchase orders.
+    Covers both the Delivery Tracking view and the Purchased Invoices view.
+    All fields are optional and fully combinable.
+    """
+    # ── Status Filters ────────────────────────────────────────────────────────
+    purchase_status: PurchaseStatus | None = Field(default=None, description="Filter by purchase lifecycle status.")
+    arrival_status: ArrivalStatus | None = Field(default=None, description="Filter by delivery / arrival status.")
+
+    # ── Financial ─────────────────────────────────────────────────────────────
+    payment_method: PaymentMethod | None = Field(default=None, description="Filter by payment method (WALLET / DIRECT).")
+    min_amount: Decimal | None = Field(default=None, ge=0, description="Minimum total_price (₹).")
+    max_amount: Decimal | None = Field(default=None, ge=0, description="Maximum total_price (₹).")
+
+    # ── Search ────────────────────────────────────────────────────────────────
+    category: str | None = Field(default=None, description="Substring search on purchase category.")
+    recycler_name: str | None = Field(default=None, description="Substring search on the seller recycler company name.")
+
+    # ── Date Range ────────────────────────────────────────────────────────────
+    start_date: datetime | None = Field(default=None, description="Filter purchases created on or after this datetime (UTC).")
+    end_date: datetime | None = Field(default=None, description="Filter purchases created on or before this datetime (UTC).")
+
+    # ── Sorting ───────────────────────────────────────────────────────────────
+    sort_by: Literal["date_desc", "date_asc", "amount_desc", "amount_asc"] = Field(default="date_desc")
+
+    # ── Pagination ────────────────────────────────────────────────────────────
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_ranges(self) -> "BrandPurchaseFilter":
+        if self.min_amount is not None and self.max_amount is not None:
+            if self.min_amount > self.max_amount:
+                raise ValueError("min_amount must be <= max_amount")
+        if self.start_date is not None and self.end_date is not None:
+            if self.start_date > self.end_date:
+                raise ValueError("start_date must be before end_date")
+        return self
+
+
+class CollectorPurchaseFilter(BaseModel):
+    """
+    Advanced filter for the Recycler's Collector Purchases section.
+    All fields are optional and fully combinable.
+    """
+    # ── Collector Search ──────────────────────────────────────────────────────
+    collector_name: str | None = Field(default=None, description="Substring (case-insensitive) search on collector_name.")
+    collector_company_name: str | None = Field(default=None, description="Substring search on collector_company_name.")
+
+    # ── Material ──────────────────────────────────────────────────────────────
+    category: MaterialType | None = Field(default=None, description="Exact match on material category enum (PLASTIC/METAL/BOTH).")
+    material_type: str | None = Field(default=None, description="Substring search on the free-text material_type field.")
+
+    # ── Financial ─────────────────────────────────────────────────────────────
+    min_amount: Decimal | None = Field(default=None, ge=0, description="Minimum purchase price (₹).")
+    max_amount: Decimal | None = Field(default=None, ge=0, description="Maximum purchase price (₹).")
+
+    # ── Date Range ────────────────────────────────────────────────────────────
+    start_date: datetime | None = Field(default=None, description="Filter records created on or after this datetime.")
+    end_date: datetime | None = Field(default=None, description="Filter records created on or before this datetime.")
+
+    # ── Sorting ───────────────────────────────────────────────────────────────
+    sort_by: Literal["date_desc", "date_asc", "amount_desc", "amount_asc"] = Field(default="date_desc")
+
+    # ── Pagination ────────────────────────────────────────────────────────────
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_ranges(self) -> "CollectorPurchaseFilter":
+        if self.min_amount is not None and self.max_amount is not None:
+            if self.min_amount > self.max_amount:
+                raise ValueError("min_amount must be <= max_amount")
+        if self.start_date is not None and self.end_date is not None:
+            if self.start_date > self.end_date:
+                raise ValueError("start_date must be before end_date")
+        return self
+
+
+class InvoiceProofFilter(BaseModel):
+    """
+    Advanced filter for the Recycler's Track Invoices section (InvoiceProofs).
+    All fields are optional and fully combinable.
+    """
+    # ── Category ──────────────────────────────────────────────────────────────
+    category: InvoiceProofCategory | None = Field(default=None, description="Filter by invoice proof category (ELECTRICITY/WATER/LOGISTICS/FUEL).")
+
+    # ── Search Term ───────────────────────────────────────────────────────────
+    document_name: str | None = Field(default=None, description="Substring (case-insensitive) search on document_name.")
+    period: str | None = Field(default=None, description="Substring search on the period string (e.g. '2024-01').")
+
+    # ── Financial Ranges ──────────────────────────────────────────────────────
+    min_amount_spent: Decimal | None = Field(default=None, ge=0, description="Minimum amount_spent (₹).")
+    max_amount_spent: Decimal | None = Field(default=None, ge=0, description="Maximum amount_spent (₹).")
+    min_total_amount_used: Decimal | None = Field(default=None, ge=0, description="Minimum total_amount_used.")
+    max_total_amount_used: Decimal | None = Field(default=None, ge=0, description="Maximum total_amount_used.")
+
+    # ── Date Range (upload date) ──────────────────────────────────────────────
+    start_date: datetime | None = Field(default=None, description="Filter records created on or after this datetime.")
+    end_date: datetime | None = Field(default=None, description="Filter records created on or before this datetime.")
+
+    # ── Sorting ───────────────────────────────────────────────────────────────
+    sort_by: Literal["date_desc", "date_asc", "amount_desc", "amount_asc"] = Field(default="date_desc")
+
+    # ── Pagination ────────────────────────────────────────────────────────────
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_ranges(self) -> "InvoiceProofFilter":
+        if self.min_amount_spent is not None and self.max_amount_spent is not None:
+            if self.min_amount_spent > self.max_amount_spent:
+                raise ValueError("min_amount_spent must be <= max_amount_spent")
+        if self.start_date is not None and self.end_date is not None:
+            if self.start_date > self.end_date:
+                raise ValueError("start_date must be before end_date")
+        return self
 
 
 # ============================================================================

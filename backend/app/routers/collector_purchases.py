@@ -1,7 +1,9 @@
 import uuid
-from typing import Optional
+from datetime import datetime
+from decimal import Decimal
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
@@ -23,6 +25,101 @@ from app.schemas import (
 from app.security import get_current_profile, require_active_company_membership
 
 router = APIRouter(prefix="/companies/{company_id}/collector-purchases", tags=["collector-purchases"])
+
+
+# ─── Advanced List (Search) ───────────────────────────────────────────────────
+
+@router.get("", response_model=list[CollectorPurchaseOut])
+async def list_collector_purchases(
+    company_id: uuid.UUID,
+    # ── Collector Search ──────────────────────────────────────────────────────
+    collector_name: Optional[str] = Query(default=None, description="Substring (case-insensitive) search on collector name."),
+    collector_company_name: Optional[str] = Query(default=None, description="Substring search on collector company name."),
+    # ── Material ──────────────────────────────────────────────────────────────
+    category: Optional[str] = Query(default=None, description="Exact enum value: PLASTIC, METAL, or BOTH."),
+    material_type: Optional[str] = Query(default=None, description="Substring search on the free-text material_type field."),
+    # ── Financial ─────────────────────────────────────────────────────────────
+    min_amount: Optional[Decimal] = Query(default=None, ge=0, description="Minimum purchase price (₹)."),
+    max_amount: Optional[Decimal] = Query(default=None, ge=0, description="Maximum purchase price (₹)."),
+    # ── Date Range ────────────────────────────────────────────────────────────
+    start_date: Optional[datetime] = Query(default=None, description="Filter records created on or after this datetime (UTC)."),
+    end_date: Optional[datetime] = Query(default=None, description="Filter records created on or before this datetime (UTC)."),
+    # ── Sorting & Pagination ──────────────────────────────────────────────────
+    sort_by: Literal["date_desc", "date_asc", "amount_desc", "amount_asc"] = Query(default="date_desc"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    membership: CompanyMember = Depends(require_active_company_membership),
+    profile: Profile = Depends(get_current_profile),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns collector purchases for this Recycler company with advanced filtering.
+    OWNER members see all purchases; MEMBER-role users see only their own records.
+    All filters are optional and fully combinable.
+    """
+    query = select(CollectorPurchase).where(CollectorPurchase.recycler_id == company_id)
+
+    # Members (non-OWNERs) can only see their own purchases
+    if membership.member_role != MemberRole.OWNER:
+        query = query.where(CollectorPurchase.created_by_profile_id == profile.id)
+
+    # ── Apply filters ──────────────────────────────────────────────────────────
+    if collector_name is not None:
+        query = query.where(CollectorPurchase.collector_name.ilike(f"%{collector_name}%"))
+    if collector_company_name is not None:
+        query = query.where(CollectorPurchase.collector_company_name.ilike(f"%{collector_company_name}%"))
+    if category is not None:
+        query = query.where(CollectorPurchase.category == category)
+    if material_type is not None:
+        query = query.where(CollectorPurchase.material_type.ilike(f"%{material_type}%"))
+    if min_amount is not None:
+        query = query.where(CollectorPurchase.price >= min_amount)
+    if max_amount is not None:
+        query = query.where(CollectorPurchase.price <= max_amount)
+    if start_date is not None:
+        query = query.where(CollectorPurchase.created_at >= start_date)
+    if end_date is not None:
+        query = query.where(CollectorPurchase.created_at <= end_date)
+
+    # ── Apply sorting ──────────────────────────────────────────────────────────
+    if sort_by == "date_asc":
+        query = query.order_by(CollectorPurchase.created_at.asc())
+    elif sort_by == "amount_desc":
+        query = query.order_by(CollectorPurchase.price.desc())
+    elif sort_by == "amount_asc":
+        query = query.order_by(CollectorPurchase.price.asc())
+    else:  # date_desc (default)
+        query = query.order_by(CollectorPurchase.created_at.desc())
+
+    query = query.limit(limit).offset(offset)
+    result = await db.execute(query)
+    return result.scalars().all()
+
+
+@router.get("/{purchase_id}", response_model=CollectorPurchaseOut)
+async def get_collector_purchase(
+    company_id: uuid.UUID,
+    purchase_id: uuid.UUID,
+    membership: CompanyMember = Depends(require_active_company_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Fetch a single collector purchase record by its ID.
+    """
+    purchase = (await db.execute(
+        select(CollectorPurchase)
+        .where(
+            CollectorPurchase.id == purchase_id,
+            CollectorPurchase.recycler_id == company_id,
+        )
+    )).scalar_one_or_none()
+
+    if not purchase:
+        raise HTTPException(status_code=404, detail="Collector purchase not found")
+
+    return purchase
+
+
 
 
 class AttachDocumentRequest(BaseModel):
