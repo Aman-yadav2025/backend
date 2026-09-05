@@ -57,7 +57,9 @@ async def handle_clerk_webhook(request: Request, db: AsyncSession = Depends(get_
             # event types we don't care about (sessions, invitations, etc.)
             return {"received": True, "handled": False}
 
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise exc
         import logging
         # Log the full traceback server-side. Do NOT return it to Clerk —
         # it leaks internal structure. Re-raise so FastAPI returns 500 and

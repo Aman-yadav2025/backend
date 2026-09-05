@@ -71,20 +71,24 @@ async def approve_refund_request(
     admin: Profile = Depends(require_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    print(f"--> [DEBUG] {request_id} Acquiring lock on RefundRequest...", flush=True)
     # Lock the refund request row
     result = await db.execute(select(RefundRequest).where(RefundRequest.id == request_id).with_for_update())
     refund_req = result.scalar_one_or_none()
+    print(f"--> [DEBUG] {request_id} Acquired RefundRequest lock.", flush=True)
     if refund_req is None:
         raise HTTPException(status_code=404, detail="Refund request not found")
 
     if refund_req.status != RefundRequestStatus.PENDING:
         raise HTTPException(status_code=400, detail="Only pending requests can be approved")
 
+    print(f"--> [DEBUG] {request_id} Acquiring lock on Payment...", flush=True)
     # Lock the payment row — serializes all concurrent approvals for the same payment
     payment_result = await db.execute(
         select(Payment).where(Payment.id == refund_req.payment_id).with_for_update()
     )
     payment = payment_result.scalar_one_or_none()
+    print(f"--> [DEBUG] {request_id} Acquired Payment lock.", flush=True)
 
     if payment is None or not payment.razorpay_payment_id:
         raise HTTPException(status_code=400, detail="Associated payment or Razorpay payment ID missing")
@@ -109,12 +113,14 @@ async def approve_refund_request(
         )
 
     # Now it's safe to call Razorpay
+    print(f"--> [DEBUG] {request_id} Calling Razorpay...", flush=True)
     try:
         refund_result = await razorpay_client.refund_payment(
             payment_id=payment.razorpay_payment_id,
             amount_in_rupees=float(refund_req.amount),
             receipt=f"rfnd_{refund_req.id.hex[:10]}",
         )
+        print(f"--> [DEBUG] {request_id} Razorpay returned successfully.", flush=True)
     except Exception as exc:
         # --- FIX #4: Log full error server-side, return generic message ---
         logger.exception("Razorpay refund failed for request %s", request_id)
@@ -151,7 +157,9 @@ async def approve_refund_request(
         else:
             payment.status = PaymentStatus.PARTIALLY_REFUNDED
 
+    print(f"--> [DEBUG] {request_id} Committing...", flush=True)
     await db.commit()
+    print(f"--> [DEBUG] {request_id} Committed. Releasing locks.", flush=True)
     await db.refresh(refund_req)
     return refund_req
 
@@ -180,17 +188,20 @@ async def reject_refund_request(
     refund_req.actioned_by = admin.id
     refund_req.actioned_at = datetime.now(timezone.utc)
 
+    # --- FIX #7: safer payment status reset ---
     payment_result = await db.execute(
         select(Payment).where(Payment.id == refund_req.payment_id).with_for_update()
     )
     payment = payment_result.scalar_one_or_none()
-    if payment and payment.status == PaymentStatus.PENDING_REFUND:
+    if payment:
+        # Check if there are any OTHER pending requests
         other_pending = await db.execute(
             select(RefundRequest)
             .where(RefundRequest.payment_id == payment.id)
             .where(RefundRequest.id != request_id)
             .where(RefundRequest.status == RefundRequestStatus.PENDING)
         )
+
         if not other_pending.first():
             # No more pending requests — determine correct status based on
             # whether any refunds were actually approved.

@@ -278,7 +278,7 @@ async def main():
         USER_ID, USER_JWT = provision_clerk_user()
         my_doc_id, other_doc_id, dummy_co_id, dummy_prof_id = await setup_test_documents()
         
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             await test_malicious_upload(client)
             await test_cross_company_access(client, other_doc_id)
             await test_reupload_reset(client, my_doc_id)

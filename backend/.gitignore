@@ -179,3 +179,6 @@ cython_debug/
 .venv-linux/
 .gemini/
 api.md
+todos.txt
+update_tokens.py
+

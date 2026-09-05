@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 # Set working directory
 WORKDIR /app
@@ -19,8 +19,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application
 COPY . .
 
+# Create a non-root user and switch to it for better security in production
+RUN useradd -m appuser && chown -R appuser /app
+USER appuser
+
 # Expose the application port
 EXPOSE 8000
 
-# Command to run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run uvicorn with proxy headers enabled (for running behind Nginx/ALB/Render)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+
+#Run uvicorn with n workers and proxy headers enabled (for running behind Nginx/ALB/Render)
+#CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--workers", "n"]

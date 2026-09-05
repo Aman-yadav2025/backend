@@ -167,7 +167,15 @@ async def main():
         kpis = await get_brand_dashboard_kpis(
             company_id=company_id,
             admin_member=member,
-            db=db
+            db=db,
+            purchase_history_offset=0,
+            purchase_history_limit=10,
+            wallet_history_offset=0,
+            wallet_history_limit=10,
+            deal_invoices_offset=0,
+            deal_invoices_limit=10,
+            offline_deals_offset=0,
+            offline_deals_limit=10
         )
         
         print("\n--- KPI RESULTS ---")
@@ -191,7 +199,7 @@ async def main():
             
         print(f"\nOrder Status Summary:")
         print(f"  - Pending: {kpis.order_status_summary.pending}")
-        print(f"  - Processed: {kpis.order_status_summary.processed}")
+        print(f"  - Processing: {kpis.order_status_summary.processing}")
         print(f"  - Delivered: {kpis.order_status_summary.delivered}")
         print(f"  - Canceled: {kpis.order_status_summary.canceled}")
         

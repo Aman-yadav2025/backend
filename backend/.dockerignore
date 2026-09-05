@@ -13,7 +13,18 @@ ENV/
 .DS_Store
 .idea/
 .vscode/
-scripts/
+.pytest_cache/
+.gemini/
+
+# Documentation and scripts
 api.md
 *.md
-.gemini/
+scripts/
+todos.txt
+find_todos.py
+local_generate_docs.py
+update_tokens.py
+stress_jwks.py
+
+# Test files
+test_*.py

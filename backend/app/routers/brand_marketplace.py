@@ -324,38 +324,6 @@ async def get_recycler_profile(
     return RecyclerProfileOut.model_validate(recycler)
 
 
-@router.get("/{listing_id}", response_model=MaterialListingOut)
-async def get_listing_detail(
-    company_id: uuid.UUID,
-    listing_id: uuid.UUID,
-    deps: tuple[Company, CompanyMember] = Depends(_require_brand),
-    db: AsyncSession = Depends(get_db),
-):
-    """Returns a single active listing detail."""
-    q = select(
-        MaterialListing,
-        Company.name.label("recycler_name"),
-        Company.city.label("recycler_city"),
-        Company.state.label("recycler_state")
-    ).outerjoin(Company, MaterialListing.recycler_id == Company.id).where(
-        MaterialListing.id == listing_id,
-        MaterialListing.is_active.is_(True),
-        MaterialListing.created_by_brand_id.is_(None),
-        Company.deleted_at.is_(None)
-    )
-    result = await db.execute(q)
-    row = result.first()
-    
-    if row is None:
-        raise HTTPException(status_code=404, detail="Listing not found or no longer active")
-        
-    out = MaterialListingOut.model_validate(row.MaterialListing)
-    out.recycler_name = row.recycler_name
-    out.recycler_city = row.recycler_city
-    out.recycler_state = row.recycler_state
-    
-    return out
-
 
 # ─── Purchase ─────────────────────────────────────────────────────────────────
 
@@ -704,7 +672,44 @@ async def list_purchased_from_recyclers(
     return [RecyclerProfileOut.model_validate(r) for r in recyclers]
 
 
-# ─── Download Invoice ─────────────────────────────────────────────────────────
+# ─── Single listing detail (wildcard — must be LAST among GET routes) ─────────
+# Placed here intentionally: FastAPI matches routes in registration order.
+# Any static paths like /purchases or /purchased-from-recyclers must be
+# registered BEFORE this wildcard or they will be swallowed by it.
+
+@router.get("/{listing_id}", response_model=MaterialListingOut)
+async def get_listing_detail(
+    company_id: uuid.UUID,
+    listing_id: uuid.UUID,
+    deps: tuple[Company, CompanyMember] = Depends(_require_brand),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns a single active listing detail."""
+    q = select(
+        MaterialListing,
+        Company.name.label("recycler_name"),
+        Company.city.label("recycler_city"),
+        Company.state.label("recycler_state")
+    ).outerjoin(Company, MaterialListing.recycler_id == Company.id).where(
+        MaterialListing.id == listing_id,
+        MaterialListing.is_active.is_(True),
+        MaterialListing.created_by_brand_id.is_(None),
+        Company.deleted_at.is_(None)
+    )
+    result = await db.execute(q)
+    row = result.first()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Listing not found or no longer active")
+
+    out = MaterialListingOut.model_validate(row.MaterialListing)
+    out.recycler_name = row.recycler_name
+    out.recycler_city = row.recycler_city
+    out.recycler_state = row.recycler_state
+
+    return out
+
+
 
 @router.get("/purchases/{purchase_id}/invoice-download")
 async def download_invoice(

@@ -127,7 +127,7 @@ async def test_kpi_endpoints(client: httpx.AsyncClient, ctx: TestContext):
     print(f"✅ Spend Summary Fetched. Summaries count: {len(resp.json()['monthly_summaries'])}")
 
     print("\n--- Testing Attach Document ---")
-    resp = await client.patch(f"{BASE_URL}/companies/{ctx.company_id}/kpis/collector-purchases/{ctx.collector_deal_id}/document", json={"document_id": ctx.document_id}, headers=get_headers(ctx))
+    resp = await client.patch(f"{BASE_URL}/companies/{ctx.company_id}/collector-purchases/{ctx.collector_deal_id}/document", json={"document_id": ctx.document_id}, headers=get_headers(ctx))
     assert resp.status_code == 200, resp.text
     print(f"✅ Document successfully attached.")
 

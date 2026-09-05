@@ -136,6 +136,27 @@ uvicorn app.main:app --reload
 
 ---
 
+## 🧪 Testing & Utility Scripts
+
+A robust suite of automation and testing scripts is provided in the `scripts/` directory to help with development and CI/CD pipelines.
+
+### Automated End-to-End Tests
+These scripts automatically provision temporary test accounts in Clerk, seed the local database, run through real HTTP lifecycles, and tear down everything:
+- **`python scripts/test_marketplace.py`**: Tests the full B2B wallet checkout flow (recharge wallet via webhook → freeze funds on purchase → settle on delivery).
+- **`python scripts/test_direct_payments.py`**: Tests the Direct Payment flow via Razorpay (create purchase → simulate `payment.failed` → simulate `order.paid` → verify confirmation).
+
+### Unit & Integration Tests (Pytest)
+Run the automated test suite using `pytest`:
+- **`python -m pytest scripts/test_security_fixes.py`**: Validates JWT scoping, error masking, path traversal prevention, and pagination bounds.
+- **`python -m pytest test_*.py`**: Root-level unit tests for KPI aggregates, webhook security, and database locking logic.
+
+### Developer Utilities
+- **`python scripts/provision_admin.py [user_id]`**: Bootstraps a specific Clerk user ID as a `PLATFORM_ADMIN` to bypass the UI and test protected admin routes.
+- **`python scripts/simulate_razorpay_webhook.py [order_id] [pay_id]`**: Local testing tool that constructs and mathematically signs fake Razorpay payloads. Lets you test your webhook handlers without completing a real Razorpay checkout.
+- **`python scripts/cleanup_bucket.py`**: Scans the Cloudflare R2 bucket against the Supabase database to find and safely delete orphaned document files. Safe by default (dry-run mode); run with `--confirm` to execute deletions.
+
+---
+
 ## 🐳 Docker Production Setup (Recommended for Deployment)
 
 For staging and production servers, the backend is fully dockerized to ensure consistent environments. 
